@@ -1,5 +1,8 @@
+import { useMemo } from "react";
 import { Pressable, ScrollView, StyleSheet, Text, View } from "react-native";
 import type { ApprovalChoice, ApprovalReq } from "../types";
+import { useDashboardTheme } from "../themes/DashboardThemeProvider";
+import type { NativeThemeColors } from "../themes/types";
 
 const CHOICES: { value: ApprovalChoice; label: string }[] = [
   { value: "once", label: "Allow once" },
@@ -16,6 +19,8 @@ type Props = {
 };
 
 export function ApprovalModal({ req, onChoice }: Props) {
+  const { colors } = useDashboardTheme();
+  const styles = useMemo(() => createStyles(colors), [colors]);
   const lines = req.command.split("\n");
   const shown = lines.slice(0, CMD_PREVIEW_LINES);
   const overflow = lines.length - shown.length;
@@ -53,47 +58,49 @@ export function ApprovalModal({ req, onChoice }: Props) {
   );
 }
 
-const styles = StyleSheet.create({
+function createStyles(colors: NativeThemeColors) {
+  return StyleSheet.create({
   card: {
-    backgroundColor: "#221a10",
+    backgroundColor: colors.systemSurface,
     borderWidth: 2,
-    borderColor: "#c49a3a",
+    borderColor: colors.systemBorder,
     borderRadius: 16,
     padding: 20,
     gap: 12,
     maxWidth: 640,
     width: "100%",
   },
-  title: { color: "#ffd99e", fontSize: 18, fontWeight: "800" },
-  description: { color: "#ffe6be", fontSize: 15, lineHeight: 22 },
+  title: { color: colors.systemText, fontSize: 18, fontWeight: "800" },
+  description: { color: colors.systemText, fontSize: 15, lineHeight: 22 },
   commandBox: {
     maxHeight: 180,
-    backgroundColor: "#071111",
+    backgroundColor: colors.background,
     borderWidth: 1,
-    borderColor: "#6e5127",
+    borderColor: colors.systemBorder,
     borderRadius: 10,
     padding: 12,
   },
   commandLine: {
-    color: "#f0e6d2",
+    color: colors.midground,
     fontFamily: "Menlo, monospace",
     fontSize: 13,
     lineHeight: 20,
   },
-  overflow: { color: "#9fb8b8", fontSize: 12, marginTop: 6 },
+  overflow: { color: colors.midgroundFaint, fontSize: 12, marginTop: 6 },
   actions: { gap: 8 },
   button: {
-    backgroundColor: "#173c38",
+    backgroundColor: colors.accentStrong,
     borderWidth: 1,
-    borderColor: "#3f867a",
+    borderColor: colors.borderStrong,
     borderRadius: 10,
     paddingVertical: 12,
     paddingHorizontal: 14,
   },
   denyButton: {
-    backgroundColor: "#4b2020",
-    borderColor: "#865050",
+    backgroundColor: colors.destructiveSurface,
+    borderColor: colors.destructiveBorder,
   },
-  buttonText: { color: "#c7fff3", fontWeight: "700", textAlign: "center" },
-  denyText: { color: "#f7d6d6" },
-});
+  buttonText: { color: colors.midground, fontWeight: "700", textAlign: "center" },
+  denyText: { color: colors.destructiveText },
+  });
+}

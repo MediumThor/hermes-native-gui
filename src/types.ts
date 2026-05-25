@@ -69,15 +69,40 @@ export type ChatMessage = {
   role: "user" | "assistant" | "system" | "tool";
   text: string;
   status?: "streaming" | "complete" | "error" | "interrupted";
+  reasoning?: string;
   createdAt: number;
+};
+
+export type SlashCompletionItem = {
+  text: string;
+  display?: string;
+  meta?: string;
+};
+
+export type SlashCompletionResult = {
+  items: SlashCompletionItem[];
+  replace_from?: number;
 };
 
 export type ToolActivity = {
   id: string;
   name: string;
-  status: "running" | "complete";
+  status: "running" | "complete" | "error";
   preview?: string;
   result?: string;
+  summary?: string;
+  inlineDiff?: string;
+  error?: string;
+  startedAt?: number;
+  completedAt?: number;
+  rawPayload?: unknown;
+};
+
+export type SessionRuntimeState = {
+  running: boolean;
+  blocked: boolean;
+  activity: string;
+  updatedAt: number;
 };
 
 export type SessionSummary = {

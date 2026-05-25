@@ -1,9 +1,11 @@
-import type { ReactNode } from "react";
+import { useMemo, type ReactNode } from "react";
 import { Modal, Pressable, StyleSheet, View } from "react-native";
 import type { ApprovalChoice, OverlayState } from "../types";
 import { ApprovalModal } from "./ApprovalModal";
 import { ClarifyPicker } from "./ClarifyPicker";
 import { SecureInputModal } from "./SecureInputModal";
+import { useDashboardTheme } from "../themes/DashboardThemeProvider";
+import type { NativeThemeColors } from "../themes/types";
 
 type Props = {
   overlay: OverlayState;
@@ -20,6 +22,8 @@ export function BlockingOverlays({
   onSudoSubmit,
   onSecretSubmit,
 }: Props) {
+  const { colors } = useDashboardTheme();
+  const styles = useMemo(() => createStyles(colors), [colors]);
   const visible = Boolean(
     overlay.approval || overlay.clarify || overlay.sudo || overlay.secret,
   );
@@ -68,10 +72,11 @@ export function BlockingOverlays({
   );
 }
 
-const styles = StyleSheet.create({
+function createStyles(colors: NativeThemeColors) {
+  return StyleSheet.create({
   backdrop: {
     flex: 1,
-    backgroundColor: "rgba(0, 0, 0, 0.72)",
+    backgroundColor: colors.overlay,
     justifyContent: "center",
     alignItems: "center",
     padding: 24,
@@ -80,4 +85,5 @@ const styles = StyleSheet.create({
     width: "100%",
     alignItems: "center",
   },
-});
+  });
+}

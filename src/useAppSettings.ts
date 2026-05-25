@@ -3,13 +3,21 @@ import { Platform } from "react-native";
 
 const STORAGE_KEY = "hermes-native-gui-settings";
 
+export type SessionsViewMode = "list" | "grid";
+
 export type AppSettings = {
   /** Stop the in-flight turn before starting a new chat or resuming another session. */
   interruptOnNewChat: boolean;
+  /** Reattach the last live gateway session after connecting (never creates a new one). */
+  autoResumeOnConnect: boolean;
+  /** Layout for the sessions pane. */
+  sessionsViewMode: SessionsViewMode;
 };
 
 const DEFAULT_SETTINGS: AppSettings = {
   interruptOnNewChat: true,
+  autoResumeOnConnect: true,
+  sessionsViewMode: "list",
 };
 
 function readStoredSettings(): AppSettings {
@@ -26,6 +34,14 @@ function readStoredSettings(): AppSettings {
         typeof parsed.interruptOnNewChat === "boolean"
           ? parsed.interruptOnNewChat
           : DEFAULT_SETTINGS.interruptOnNewChat,
+      autoResumeOnConnect:
+        typeof parsed.autoResumeOnConnect === "boolean"
+          ? parsed.autoResumeOnConnect
+          : DEFAULT_SETTINGS.autoResumeOnConnect,
+      sessionsViewMode:
+        parsed.sessionsViewMode === "grid" || parsed.sessionsViewMode === "list"
+          ? parsed.sessionsViewMode
+          : DEFAULT_SETTINGS.sessionsViewMode,
     };
   } catch {
     return DEFAULT_SETTINGS;
@@ -56,11 +72,38 @@ export function useAppSettings() {
     });
   }, []);
 
+  const setAutoResumeOnConnect = useCallback((autoResumeOnConnect: boolean) => {
+    setSettings((prev) => {
+      const next = { ...prev, autoResumeOnConnect };
+      writeStoredSettings(next);
+      return next;
+    });
+  }, []);
+
+  const setSessionsViewMode = useCallback((sessionsViewMode: SessionsViewMode) => {
+    setSettings((prev) => {
+      const next = { ...prev, sessionsViewMode };
+      writeStoredSettings(next);
+      return next;
+    });
+  }, []);
+
   return useMemo(
     () => ({
       interruptOnNewChat: settings.interruptOnNewChat,
       setInterruptOnNewChat,
+      autoResumeOnConnect: settings.autoResumeOnConnect,
+      setAutoResumeOnConnect,
+      sessionsViewMode: settings.sessionsViewMode,
+      setSessionsViewMode,
     }),
-    [settings.interruptOnNewChat, setInterruptOnNewChat],
+    [
+      settings.autoResumeOnConnect,
+      settings.interruptOnNewChat,
+      settings.sessionsViewMode,
+      setAutoResumeOnConnect,
+      setInterruptOnNewChat,
+      setSessionsViewMode,
+    ],
   );
 }

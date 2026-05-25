@@ -74,12 +74,43 @@ Environment variables:
 | `HERMES_NATIVE_GUI_PYTHON` | Python executable used for the bridge | Hermes venv Python, then `python3`, then `python` |
 | `HERMES_NATIVE_GUI_WEB_PORT` | Static web UI port | `8765` |
 | `HERMES_NATIVE_GUI_BRIDGE_PORT` | WebSocket bridge port | `8766` |
+| `HERMES_NATIVE_GUI_BRIDGE_TOKEN` | Optional fixed bridge auth token (auto-generated if unset) | unset |
 | `HERMES_NATIVE_GUI_HOST` | Bridge bind host | `127.0.0.1` |
 | `HERMES_NATIVE_GUI_ALLOW_REMOTE` | Set to `1` to allow non-localhost bridge binding | unset |
 
 ## Security note
 
 The bridge binds to localhost by default. Keep it that way unless you know exactly what you are doing: anyone who can connect to the bridge can drive your local Hermes agent and its tools.
+
+Security controls in this repo:
+
+- Bridge WebSocket connections require a per-run auth token (passed to the UI by the launcher).
+- Browser WebSocket handshakes must come from an allowed local UI origin (blocks cross-site WebSocket hijacking). Missing `Origin` is allowed for non-browser clients such as test scripts.
+- The UI only allows loopback bridge URLs (`ws://127.0.0.1` / `ws://localhost`).
+- The launcher verifies an existing bridge on port 8766 is this app (`/health.service`) and has a matching token file before reusing it.
+- The static web server exposes `/bridge-config.json` (same-origin only) with the bridge token and WebSocket URL.
+- The static server sends CSP, `X-Frame-Options: DENY`, `X-Content-Type-Options: nosniff`, and `Referrer-Policy: no-referrer`.
+
+Token flow:
+
+1. Launcher generates `HERMES_NATIVE_GUI_BRIDGE_TOKEN` and passes it to the bridge process.
+2. Bridge writes `~/.hermes/hermes-native-gui-bridge-<port>.token` with `0600` permissions.
+3. UI captures the token from the initial `?bridgeToken=` URL param (then removes it), `sessionStorage`, dev env, or `/bridge-config.json`.
+4. UI appends `?token=` to the WebSocket URL when connecting.
+
+If you start the bridge manually (`npm run bridge`), read the token from stderr or `~/.hermes/hermes-native-gui-bridge-8766.token`, then open the UI with `?bridgeToken=...` in the URL or load `/bridge-config.json` from the static server.
+
+Remote bind:
+
+- Setting `HERMES_NATIVE_GUI_ALLOW_REMOTE=1` allows non-loopback binding, but also requires an explicit `HERMES_NATIVE_GUI_BRIDGE_TOKEN`.
+- Raw `ws://` over a LAN is not safe. Use TLS (`wss://`) or a secure tunnel if you truly need remote access.
+
+Verify the security baseline:
+
+```bash
+npm run serve
+npm run verify:security
+```
 
 ## Architecture
 

@@ -27,6 +27,7 @@
     "build:web": "expo export --platform web --output-dir dist",
     "prepack": "npm run build:web",
     "serve": "node bin/hermes-native-gui.js --no-open",
+    "verify:security": "node scripts/verify-bridge-security.mjs",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
@@ -38,6 +39,7 @@
     "react": "19.1.0",
     "react-dom": "19.1.0",
     "react-native": "0.81.5",
+    "react-native-markdown-display": "^7.0.2",
     "react-native-web": "^0.21.0"
   },
   "devDependencies": {

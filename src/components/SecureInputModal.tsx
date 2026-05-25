@@ -1,5 +1,7 @@
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import { Pressable, StyleSheet, Text, TextInput, View } from "react-native";
+import { useDashboardTheme } from "../themes/DashboardThemeProvider";
+import type { NativeThemeColors } from "../themes/types";
 
 type Props = {
   icon: string;
@@ -18,6 +20,8 @@ export function SecureInputModal({
   onSubmit,
   onCancel,
 }: Props) {
+  const { colors } = useDashboardTheme();
+  const styles = useMemo(() => createStyles(colors), [colors]);
   const [value, setValue] = useState("");
 
   return (
@@ -30,18 +34,33 @@ export function SecureInputModal({
         value={value}
         onChangeText={setValue}
         placeholder="Enter value…"
-        placeholderTextColor="#7f9292"
+        placeholderTextColor={colors.midgroundMuted}
         secureTextEntry
         autoFocus
         autoCapitalize="none"
         autoCorrect={false}
-        onSubmitEditing={() => onSubmit(value)}
+        onSubmitEditing={() => {
+          onSubmit(value);
+          setValue("");
+        }}
       />
       <View style={styles.row}>
-        <Pressable style={[styles.button, styles.primaryButton]} onPress={() => onSubmit(value)}>
+        <Pressable
+          style={[styles.button, styles.primaryButton]}
+          onPress={() => {
+            onSubmit(value);
+            setValue("");
+          }}
+        >
           <Text style={styles.primaryText}>{submitLabel}</Text>
         </Pressable>
-        <Pressable style={styles.button} onPress={onCancel}>
+        <Pressable
+          style={styles.button}
+          onPress={() => {
+            setValue("");
+            onCancel();
+          }}
+        >
           <Text style={styles.buttonText}>Cancel</Text>
         </Pressable>
       </View>
@@ -49,11 +68,12 @@ export function SecureInputModal({
   );
 }
 
-const styles = StyleSheet.create({
+function createStyles(colors: NativeThemeColors) {
+  return StyleSheet.create({
   card: {
-    backgroundColor: "#102222",
+    backgroundColor: colors.surfaceElevated,
     borderWidth: 1,
-    borderColor: "#3f867a",
+    borderColor: colors.borderStrong,
     borderRadius: 16,
     padding: 20,
     gap: 12,
@@ -61,13 +81,13 @@ const styles = StyleSheet.create({
     width: "100%",
   },
   icon: { fontSize: 28 },
-  label: { color: "#f0e6d2", fontSize: 17, fontWeight: "700", lineHeight: 24 },
-  sub: { color: "#9fb8b8", fontSize: 14 },
+  label: { color: colors.midground, fontSize: 17, fontWeight: "700", lineHeight: 24 },
+  sub: { color: colors.midgroundFaint, fontSize: 14 },
   input: {
-    color: "#f0e6d2",
-    backgroundColor: "#071111",
+    color: colors.midground,
+    backgroundColor: colors.background,
     borderWidth: 1,
-    borderColor: "#284848",
+    borderColor: colors.border,
     borderRadius: 10,
     paddingHorizontal: 12,
     paddingVertical: 12,
@@ -77,16 +97,17 @@ const styles = StyleSheet.create({
   button: {
     flex: 1,
     borderWidth: 1,
-    borderColor: "#284848",
+    borderColor: colors.border,
     borderRadius: 10,
     paddingVertical: 12,
     alignItems: "center",
-    backgroundColor: "#0d1d1d",
+    backgroundColor: colors.surfaceElevated,
   },
   primaryButton: {
-    backgroundColor: "#173c38",
-    borderColor: "#3f867a",
+    backgroundColor: colors.accentStrong,
+    borderColor: colors.borderStrong,
   },
-  buttonText: { color: "#9fb8b8", fontWeight: "700" },
-  primaryText: { color: "#c7fff3", fontWeight: "800" },
-});
+  buttonText: { color: colors.midgroundFaint, fontWeight: "700" },
+  primaryText: { color: colors.midground, fontWeight: "800" },
+  });
+}
