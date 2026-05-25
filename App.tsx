@@ -36,10 +36,11 @@ import type { SessionSummary, SlashCompletionResult, SlashCompletionItem } from 
 import { SettingsPane } from "./src/panes/SettingsPane";
 import { ModelsPane } from "./src/panes/ModelsPane";
 import { ToolsPane } from "./src/panes/ToolsPane";
-import { CommandsPane, CronPane, KeysPane, PluginsPane, SystemPane } from "./src/panes/ResourcePanes";
+import { CommandsPane, CronPane, KeysPane, SystemPane } from "./src/panes/ResourcePanes";
+import { PluginsPane } from "./src/panes/PluginsPane";
 import { SkillsPane } from "./src/panes/SkillsPane";
-import { normalizeModelOptions, normalizeSkillHubBrowse, normalizeSkillsList, normalizeToolsets } from "./src/bridgeContracts";
-import type { SkillHubBrowse, SkillHubItem, SkillSummary } from "./src/bridgeContracts";
+import { normalizeModelOptions, normalizePluginsList, normalizeSkillHubBrowse, normalizeSkillsList, normalizeToolsets, pluginRegistryName } from "./src/bridgeContracts";
+import type { PluginSummary, SkillHubBrowse, SkillHubItem, SkillSummary } from "./src/bridgeContracts";
 import { DashboardThemeProvider, useDashboardTheme } from "./src/themes/DashboardThemeProvider";
 import { injectWebScrollbarStyles } from "./src/web/scrollbarStyles";
 
@@ -134,7 +135,9 @@ function App() {
   const [skillsHubSearchResults, setSkillsHubSearchResults] = useState<SkillHubItem[]>([]);
   const [skillsSavingKey, setSkillsSavingKey] = useState<string | null>(null);
   const [commandCatalog, setCommandCatalog] = useState<any>(null);
-  const [pluginsList, setPluginsList] = useState<any[]>([]);
+  const [pluginsList, setPluginsList] = useState<PluginSummary[]>([]);
+  const [pluginsSavingKey, setPluginsSavingKey] = useState<string | null>(null);
+  const [pluginsRescanning, setPluginsRescanning] = useState(false);
   const [profileInfo, setProfileInfo] = useState<any>(null);
   const [browserState, setBrowserState] = useState<any>(null);
   const [auxLoading, setAuxLoading] = useState(false);
@@ -653,8 +656,13 @@ function App() {
       } else if (pane === "commands") {
         setCommandCatalog(await hermes.request("commands.catalog"));
       } else if (pane === "plugins") {
-        const result = await hermes.request("plugins.list");
-        setPluginsList(Array.isArray((result as any)?.plugins) ? (result as any).plugins : []);
+        try {
+          const result = await hermes.request("plugins.listDetailed");
+          setPluginsList(normalizePluginsList(result));
+        } catch {
+          const legacy = await hermes.request("plugins.list");
+          setPluginsList(normalizePluginsList(legacy));
+        }
       } else if (pane === "tools") {
         const tools = await hermes.listToolsets();
         setToolsets(normalizeToolsets(tools));
@@ -782,6 +790,41 @@ function App() {
       setAuxMessage(`Reload failed: ${error?.message ?? "unknown error"}`);
     } finally {
       setAuxLoading(false);
+    }
+  };
+
+  const rescanPlugins = async () => {
+    if (!hermes.connected) return;
+    setPluginsRescanning(true);
+    setAuxMessage("Rescanning plugins…");
+    try {
+      const result: any = await hermes.request("plugins.listDetailed", { force: true });
+      setPluginsList(normalizePluginsList(result));
+      setAuxMessage(`Rescanned ${normalizePluginsList(result).length} plugin(s).`);
+    } catch (error: any) {
+      setAuxMessage(`Rescan failed: ${error?.message ?? "unknown error"}`);
+    } finally {
+      setPluginsRescanning(false);
+    }
+  };
+
+  const togglePlugin = async (plugin: PluginSummary) => {
+    if (!hermes.connected) return;
+    const name = pluginRegistryName(plugin);
+    if (!name) return;
+    const enabled = plugin.enabled === false;
+    setPluginsSavingKey(`plugin:${name}`);
+    setAuxMessage(`${enabled ? "Enabling" : "Disabling"} ${name}…`);
+    try {
+      await hermes.request("plugins.toggle", { name, enabled });
+      setPluginsList((prev) => prev.map((entry) => (
+        pluginRegistryName(entry) === name ? { ...entry, enabled } : entry
+      )));
+      setAuxMessage(`${name} ${enabled ? "enabled" : "disabled"}. New sessions pick this up automatically.`);
+    } catch (error: any) {
+      setAuxMessage(`Plugin update failed: ${error?.message ?? "unknown error"}`);
+    } finally {
+      setPluginsSavingKey(null);
     }
   };
 
@@ -937,7 +980,7 @@ function App() {
     models: "Provider and model picker backed by Hermes /model.",
     tools: "Toolset enablement backed by Hermes tool configuration.",
     skills: "Installed skills, hub browse, and enable/disable controls.",
-    plugins: "Loaded plugins plus MCP/tool reload controls.",
+    plugins: "Installed plugins with enable/disable, rescan, and MCP reload.",
     cron: "Scheduled Hermes jobs.",
     keys: "Credential setup status without exposing secret values.",
     system: "Profile, config, and live process status.",
@@ -1149,9 +1192,13 @@ function App() {
             connected={hermes.connected}
             loading={auxLoading}
             message={auxMessage}
+            savingKey={pluginsSavingKey}
+            rescanning={pluginsRescanning}
             plugins={pluginsList}
             onRefresh={() => void loadAuxiliaryData("plugins")}
+            onRescan={() => void rescanPlugins()}
             onReloadMcp={() => void reloadMcp()}
+            onTogglePlugin={(plugin) => void togglePlugin(plugin)}
           />
         );
       case "cron":

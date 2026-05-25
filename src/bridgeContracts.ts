@@ -97,10 +97,39 @@ export function normalizeSkillHubBrowse(value: unknown): SkillHubBrowse {
 export type PluginSummary = {
   id?: string;
   name?: string;
+  key?: string;
+  kind?: string;
   version?: string;
   description?: string;
+  source?: string;
   status?: string;
+  enabled?: boolean;
+  tools?: number;
+  hooks?: number;
+  commands?: number;
+  error?: string | null;
 };
+
+export function pluginRegistryName(plugin: PluginSummary): string {
+  return String(plugin.key ?? plugin.name ?? plugin.id ?? "");
+}
+
+export function normalizePluginsList(value: unknown): PluginSummary[] {
+  const record = value && typeof value === "object" ? value as Record<string, unknown> : {};
+  const plugins = Array.isArray(record.plugins) ? record.plugins : asRecordArray<PluginSummary>(value);
+  return plugins
+    .map((plugin) => ({
+      ...plugin,
+      key: String(plugin.key ?? plugin.name ?? plugin.id ?? ""),
+      name: String(plugin.name ?? plugin.key ?? plugin.id ?? ""),
+      enabled: plugin.enabled !== false,
+      tools: Number(plugin.tools ?? 0) || 0,
+      hooks: Number(plugin.hooks ?? 0) || 0,
+      commands: Number(plugin.commands ?? 0) || 0,
+    }))
+    .filter((plugin) => pluginRegistryName(plugin))
+    .sort((a, b) => pluginRegistryName(a).localeCompare(pluginRegistryName(b)));
+}
 
 export type BridgeDataStatus = "idle" | "loading" | "ready" | "error";
 

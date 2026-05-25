@@ -90,8 +90,6 @@ except Exception as exc:  # pragma: no cover - user-facing startup diagnostic
 def _install_native_gui_methods() -> None:
     """Small GUI-only RPC helpers layered on top of Hermes' gateway methods."""
     methods = getattr(tui_server, "_methods", {})
-    if "image.clear" in methods and "skills.listInstalled" in methods:
-        return
 
     if "image.clear" not in methods:
 
@@ -144,6 +142,44 @@ def _install_native_gui_methods() -> None:
                 return tui_server._ok(rid, {"name": name, "enabled": enabled})
             except Exception as exc:
                 return tui_server._err(rid, 5027, str(exc))
+
+    if "plugins.listDetailed" not in methods:
+
+        @tui_server.method("plugins.listDetailed")
+        def _(rid, params: dict) -> dict:
+            try:
+                from hermes_cli.plugins import get_plugin_manager
+
+                mgr = get_plugin_manager()
+                if params.get("force"):
+                    mgr.discover_and_load(force=True)
+                return tui_server._ok(rid, {"plugins": mgr.list_plugins()})
+            except Exception as exc:
+                return tui_server._err(rid, 5028, str(exc))
+
+        @tui_server.method("plugins.toggle")
+        def _(rid, params: dict) -> dict:
+            name = str(params.get("name", "") or "").strip()
+            if not name:
+                return tui_server._err(rid, 4018, "name required")
+            if "enabled" not in params:
+                return tui_server._err(rid, 4002, "enabled required")
+            try:
+                from hermes_cli.plugins_cmd import dashboard_set_agent_plugin_enabled
+
+                result = dashboard_set_agent_plugin_enabled(
+                    name,
+                    enabled=bool(params.get("enabled")),
+                )
+                if not result.get("ok"):
+                    return tui_server._err(
+                        rid,
+                        5029,
+                        str(result.get("error") or "plugin toggle failed"),
+                    )
+                return tui_server._ok(rid, result)
+            except Exception as exc:
+                return tui_server._err(rid, 5029, str(exc))
 
 
 def _install_transport_rebind_patch() -> None:

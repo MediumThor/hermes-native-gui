@@ -1,5 +1,5 @@
 import { Pressable, Text, View } from "react-native";
-import type { AgentProcess, ConfigSection, CronJob, PluginSummary, SetupStatusProvider } from "../bridgeContracts";
+import type { AgentProcess, ConfigSection, CronJob, SetupStatusProvider } from "../bridgeContracts";
 import { asRecordArray, displayValue } from "../bridgeContracts";
 import { AuxToolbar, Card, EmptyState, PaneScroll, SectionHeader, SecondaryButton } from "../components/DashboardPrimitives";
 import { useDashboardTheme } from "../themes/DashboardThemeProvider";
@@ -43,36 +43,6 @@ export function CommandsPane({ connected, loading, message, commandCatalog, onRe
             ))}
           </View>
         )) : <EmptyState title="No commands loaded" message="Connect and refresh to load the slash command catalog." />}
-      </Card>
-    </PaneScroll>
-  );
-}
-
-export function PluginsPane({ connected, loading, message, plugins, onRefresh, onReloadMcp }: ResourcePaneBaseProps & {
-  plugins: PluginSummary[];
-  onRefresh: () => void;
-  onReloadMcp: () => void;
-}) {
-  const { styles } = useDashboardTheme();
-  return (
-    <PaneScroll>
-      <AuxToolbar
-        connected={connected}
-        loading={loading}
-        message={message}
-        onRefresh={onRefresh}
-        actions={<SecondaryButton label="Reload MCP" onPress={onReloadMcp} disabled={!connected || loading} />}
-      />
-      <Card>
-        <SectionHeader title="Loaded plugins" subtitle={`${plugins.length} plugin(s) reported by Hermes.`} />
-        {plugins.length ? plugins.map((plugin, index) => (
-          <View key={String(plugin?.name ?? plugin?.id ?? index)} style={styles.listRow}>
-            <Text selectable style={styles.settingRowTitle}>{String(plugin?.name ?? plugin?.id ?? `Plugin ${index + 1}`)}</Text>
-            {plugin?.version ? <Text selectable style={styles.settingHelp}>Version {String(plugin.version)}</Text> : null}
-            {plugin?.description ? <Text selectable style={styles.toolPreview}>{String(plugin.description)}</Text> : null}
-            {plugin?.status ? <Text selectable style={styles.toolStatus}>{String(plugin.status)}</Text> : null}
-          </View>
-        )) : <EmptyState title="No plugins loaded" message="Connect and refresh after configuring plugins or MCP servers." />}
       </Card>
     </PaneScroll>
   );

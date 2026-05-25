@@ -303,7 +303,7 @@ export function MainMenu({
       title: "System",
       items: [
         renderPaneItem("skills", "Skills", "Install, browse, and toggle skills", Package),
-        renderPaneItem("plugins", "Plugins", "Plugins and MCP reload", Plug),
+        renderPaneItem("plugins", "Plugins", "Browse, toggle, and rescan plugins", Plug),
         renderPaneItem("cron", "Cron", "Scheduled jobs", CalendarClock),
         renderPaneItem("system", "System", "Profile and config", ShieldCheck),
         renderPaneItem("logs", "Runtime", "Process and browser state", TerminalSquare),
