@@ -1,0 +1,14 @@
+{
+  "expo": {
+    "name": "Hermes Native GUI",
+    "slug": "hermes-native-gui",
+    "version": "0.1.0",
+    "orientation": "default",
+    "platforms": ["web", "ios", "android"],
+    "userInterfaceStyle": "dark",
+    "web": {
+      "bundler": "metro",
+      "output": "single"
+    }
+  }
+}
