@@ -1,4 +1,4 @@
-import type { DashboardTheme, ThemeLayout, ThemeTypography } from "./types";
+import type { DashboardTheme, NativeThemeColors, ThemeLayout, ThemeTypography } from "./types";
 
 const SYSTEM_SANS =
   'system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif';
@@ -15,6 +15,72 @@ const DEFAULT_TYPOGRAPHY: ThemeTypography = {
 const DEFAULT_LAYOUT: ThemeLayout = {
   radius: "0.5rem",
   density: "comfortable",
+};
+
+const SAILDASH_TYPOGRAPHY: ThemeTypography = {
+  fontSans: '-apple-system, BlinkMacSystemFont, "SF Pro Display", "SF Pro Text", system-ui, sans-serif',
+  fontMono: SYSTEM_MONO,
+  baseSize: "15px",
+  lineHeight: "1.55",
+  letterSpacing: "-0.01em",
+};
+
+const saildashLightNativeColors: NativeThemeColors = {
+  background: "#ece9df",
+  surface: "#f5f3ed",
+  surfaceElevated: "#ffffff",
+  midground: "#01161e",
+  midgroundMuted: "rgba(1,22,30,0.76)",
+  midgroundFaint: "rgba(1,22,30,0.56)",
+  highlight: "#124559",
+  border: "#aec3b0",
+  borderStrong: "#598392",
+  accent: "#e2d7a3",
+  accentStrong: "#cbd8c8",
+  warmGlow: "rgba(203, 190, 122, 0.34)",
+  destructive: "#ff3b30",
+  success: "#124559",
+  warning: "#ff9500",
+  radius: 14,
+  onBackground: "#ffffff",
+  destructiveSurface: "#ffe6e3",
+  destructiveBorder: "rgba(255,59,48,0.42)",
+  destructiveText: "#c21f17",
+  systemSurface: "#fff3d6",
+  systemBorder: "rgba(255,149,0,0.36)",
+  systemText: "#8a4b00",
+  userBubble: "#dceaf0",
+  userBubbleBorder: "#9bc4dd",
+  overlay: "rgba(1,22,30,0.38)",
+};
+
+const saildashDarkNativeColors: NativeThemeColors = {
+  background: "#18181b",
+  surface: "rgba(31, 31, 35, 0.94)",
+  surfaceElevated: "rgba(39, 39, 42, 0.90)",
+  midground: "#ffffff",
+  midgroundMuted: "rgba(255,255,255,0.86)",
+  midgroundFaint: "rgba(212,212,216,0.68)",
+  highlight: "#60a5fa",
+  border: "rgba(255,255,255,0.12)",
+  borderStrong: "rgba(96,165,250,0.52)",
+  accent: "rgba(96,165,250,0.18)",
+  accentStrong: "rgba(96,165,250,0.34)",
+  warmGlow: "rgba(245, 158, 11, 0.38)",
+  destructive: "#ff3b30",
+  success: "#60a5fa",
+  warning: "#f59e0b",
+  radius: 14,
+  onBackground: "#18181b",
+  destructiveSurface: "rgba(255,59,48,0.18)",
+  destructiveBorder: "rgba(255,59,48,0.44)",
+  destructiveText: "#ff6961",
+  systemSurface: "rgba(245,158,11,0.18)",
+  systemBorder: "rgba(245,158,11,0.46)",
+  systemText: "#fbbf24",
+  userBubble: "rgba(96,165,250,0.24)",
+  userBubbleBorder: "rgba(96,165,250,0.56)",
+  overlay: "rgba(0,0,0,0.72)",
 };
 
 export const defaultTheme: DashboardTheme = {
@@ -41,6 +107,38 @@ export const defaultLargeTheme: DashboardTheme = {
   palette: defaultTheme.palette,
   typography: { ...DEFAULT_TYPOGRAPHY, baseSize: "18px", lineHeight: "1.65" },
   layout: { ...DEFAULT_LAYOUT, density: "spacious" },
+};
+
+export const saildashLightTheme: DashboardTheme = {
+  name: "saildash-light",
+  label: "SailDash Light",
+  description: "SailPulse/SailDash iOS light — warm deck, glass cards, nautical teal accents",
+  palette: {
+    background: { hex: "#ece9df", alpha: 1 },
+    midground: { hex: "#124559", alpha: 1 },
+    foreground: { hex: "#ffffff", alpha: 0 },
+    warmGlow: "rgba(203, 190, 122, 0.34)",
+    noiseOpacity: 0.2,
+  },
+  typography: SAILDASH_TYPOGRAPHY,
+  layout: { ...DEFAULT_LAYOUT, radius: "14px" },
+  nativeColors: saildashLightNativeColors,
+};
+
+export const saildashDarkTheme: DashboardTheme = {
+  name: "saildash-dark",
+  label: "SailDash Dark",
+  description: "SailPulse/SailDash iOS dark — zinc cockpit surfaces, sky-blue active states, amber signal glow",
+  palette: {
+    background: { hex: "#18181b", alpha: 1 },
+    midground: { hex: "#60a5fa", alpha: 1 },
+    foreground: { hex: "#ffffff", alpha: 0 },
+    warmGlow: "rgba(245, 158, 11, 0.36)",
+    noiseOpacity: 0.7,
+  },
+  typography: SAILDASH_TYPOGRAPHY,
+  layout: { ...DEFAULT_LAYOUT, radius: "14px" },
+  nativeColors: saildashDarkNativeColors,
 };
 
 export const midnightTheme: DashboardTheme = {
@@ -145,6 +243,8 @@ export const BUILTIN_THEMES: Record<string, DashboardTheme> = {
   default: defaultTheme,
   "high-contrast": highContrastTheme,
   "default-large": defaultLargeTheme,
+  "saildash-light": saildashLightTheme,
+  "saildash-dark": saildashDarkTheme,
   midnight: midnightTheme,
   ember: emberTheme,
   mono: monoTheme,

@@ -24,27 +24,35 @@ function createStyles(colors: NativeThemeColors) {
   return StyleSheet.create({
     bubble: {
       maxWidth: 900,
-      alignSelf: "flex-start",
-      backgroundColor: colors.surfaceElevated,
+      alignSelf: "stretch",
+      gap: 8,
+    },
+    userBubble: {
+      alignSelf: "flex-end",
+      maxWidth: 760,
+      backgroundColor: colors.userBubble,
       borderWidth: 1,
-      borderColor: colors.border,
-      borderRadius: 16,
-      padding: 16,
+      borderColor: colors.userBubbleBorder,
+      borderRadius: 14,
+      paddingHorizontal: 14,
+      paddingVertical: 10,
     },
-    userBubble: { alignSelf: "flex-end", backgroundColor: colors.userBubble, borderColor: colors.userBubbleBorder },
-    systemBubble: { backgroundColor: colors.systemSurface, borderColor: colors.systemBorder },
-    headerRow: { flexDirection: "row", alignItems: "center", justifyContent: "space-between", gap: 8 },
-    headerSpacer: { flex: 1 },
-    role: {
-      color: colors.success,
-      fontSize: 12,
-      fontWeight: "800",
-      textTransform: "uppercase",
-      marginBottom: 8,
-      flex: 1,
+    assistantBubble: {
+      paddingVertical: 2,
     },
-    userRole: { color: colors.highlight },
-    systemRole: { color: colors.systemText },
+    systemBubble: {
+      borderWidth: 1,
+      borderColor: colors.systemBorder,
+      borderRadius: 12,
+      backgroundColor: colors.systemSurface,
+      padding: 12,
+    },
+    headerRow: {
+      flexDirection: "row",
+      alignItems: "center",
+      justifyContent: "flex-end",
+      gap: 8,
+    },
     copyButton: {
       flexDirection: "row",
       alignItems: "center",
@@ -54,12 +62,24 @@ function createStyles(colors: NativeThemeColors) {
       borderRadius: 999,
       paddingHorizontal: 8,
       paddingVertical: 4,
-      marginBottom: 8,
     },
-    copyText: { color: colors.success, fontSize: 11, fontWeight: "700" },
-    messageText: { color: colors.midground, fontSize: 15, lineHeight: 22, userSelect: "text" as any },
-    userText: { color: colors.midground },
-    systemText: { color: colors.systemText },
+    copyText: { color: colors.midgroundFaint, fontSize: 11, fontWeight: "700" },
+    responseBlock: { gap: 8 },
+    messageText: {
+      color: colors.midground,
+      fontSize: 15,
+      lineHeight: 23,
+      userSelect: "text" as any,
+    },
+    userText: { color: colors.midground, fontSize: 15, lineHeight: 22 },
+    systemText: { color: colors.systemText, fontSize: 13, lineHeight: 20 },
+    streamingHint: {
+      color: colors.midgroundFaint,
+      fontSize: 11,
+      fontWeight: "700",
+      letterSpacing: 0.3,
+      textTransform: "uppercase",
+    },
   });
 }
 
@@ -88,7 +108,12 @@ export function MessageBubble({ message }: Props) {
 
   return (
     <View
-      style={[styles.bubble, isUser && styles.userBubble, isSystem && styles.systemBubble]}
+      style={[
+        styles.bubble,
+        isUser && styles.userBubble,
+        isAssistant && styles.assistantBubble,
+        isSystem && styles.systemBubble,
+      ]}
       {...(Platform.OS === "web"
         ? {
             onMouseEnter: () => setHovered(true),
@@ -96,24 +121,14 @@ export function MessageBubble({ message }: Props) {
           }
         : {})}
     >
-      {!(isAssistant && showReasoning) ? (
+      {isAssistant && isStreaming && !showReasoning ? (
+        <Text style={styles.streamingHint}>Responding</Text>
+      ) : null}
+
+      {showCopy ? (
         <View style={styles.headerRow}>
-          <Text selectable style={[styles.role, isUser && styles.userRole, isSystem && styles.systemRole]}>
-            {message.role}
-            {isStreaming ? " · streaming" : message.status === "interrupted" ? " · interrupted" : ""}
-          </Text>
-          {showCopy ? (
-            <Pressable style={styles.copyButton} onPress={() => void handleCopy()} accessibilityRole="button">
-              <Copy color={colors.success} size={14} />
-              <Text style={styles.copyText}>{copied ? "Copied" : "Copy"}</Text>
-            </Pressable>
-          ) : null}
-        </View>
-      ) : showCopy ? (
-        <View style={styles.headerRow}>
-          <View style={styles.headerSpacer} />
           <Pressable style={styles.copyButton} onPress={() => void handleCopy()} accessibilityRole="button">
-            <Copy color={colors.success} size={14} />
+            <Copy color={colors.midgroundFaint} size={14} />
             <Text style={styles.copyText}>{copied ? "Copied" : "Copy"}</Text>
           </Pressable>
         </View>
@@ -121,16 +136,20 @@ export function MessageBubble({ message }: Props) {
 
       {showReasoning ? (
         <ReasoningDropdown
-          title="Assistant"
+          title="Thought"
           streaming={isStreaming}
           reasoning={message.reasoning}
+          responseText={message.text}
         />
       ) : null}
 
-      {isStreaming && !message.text && !showReasoning ? (
+      {isAssistant && message.text ? (
+        <View style={styles.responseBlock}>
+          <MarkdownMessage text={message.text} />
+          {isStreaming ? <StreamingDots active color={colors.success} /> : null}
+        </View>
+      ) : isStreaming && !showReasoning ? (
         <StreamingDots active color={colors.success} />
-      ) : isAssistant && !isStreaming && message.text ? (
-        <MarkdownMessage text={message.text} />
       ) : (
         <Text selectable style={[styles.messageText, isUser && styles.userText, isSystem && styles.systemText]}>
           {message.text}

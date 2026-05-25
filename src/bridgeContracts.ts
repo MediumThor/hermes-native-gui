@@ -51,6 +51,9 @@ export type SkillSummary = {
   path?: string;
   category?: string | null;
   enabled?: boolean;
+  source?: string;
+  trust?: string;
+  version?: string;
 };
 
 export type SkillHubItem = {
@@ -58,6 +61,22 @@ export type SkillHubItem = {
   description?: string;
   source?: string;
   trust?: string;
+  version?: string;
+};
+
+export type DoctorCheckStatus = "ok" | "warning" | "error";
+
+export type DoctorCheck = {
+  id: string;
+  label: string;
+  status: DoctorCheckStatus;
+  detail: string;
+  command?: string;
+};
+
+export type DoctorStatusResponse = {
+  checks: DoctorCheck[];
+  generated_at?: number;
 };
 
 export type SkillHubBrowse = {
@@ -69,7 +88,16 @@ export type SkillHubBrowse = {
 
 export function normalizeSkillsList(value: unknown): SkillSummary[] {
   const record = value && typeof value === "object" ? value as Record<string, unknown> : {};
-  const skills = Array.isArray(record.skills) ? record.skills : asRecordArray<SkillSummary>(value);
+  const rawSkills = record.skills;
+  const skills = Array.isArray(rawSkills)
+    ? rawSkills
+    : rawSkills && typeof rawSkills === "object"
+      ? Object.entries(rawSkills as Record<string, unknown>).flatMap(([category, entries]) => (
+        Array.isArray(entries)
+          ? entries.map((entry) => (typeof entry === "string" ? { name: entry, category } : { ...(entry as SkillSummary), category: (entry as SkillSummary).category ?? category }))
+          : []
+      ))
+      : asRecordArray<SkillSummary>(value);
   return skills
     .map((skill) => ({
       ...skill,

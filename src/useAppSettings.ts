@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { Platform } from "react-native";
+import { isChatMode, type ChatMode } from "./chatModes";
 
 const STORAGE_KEY = "hermes-native-gui-settings";
 
@@ -12,12 +13,15 @@ export type AppSettings = {
   autoResumeOnConnect: boolean;
   /** Layout for the sessions pane. */
   sessionsViewMode: SessionsViewMode;
+  /** Composer mode: agent (full tools), plan (/plan), or ask (read-only). */
+  chatMode: import("./chatModes").ChatMode;
 };
 
 const DEFAULT_SETTINGS: AppSettings = {
   interruptOnNewChat: true,
   autoResumeOnConnect: true,
   sessionsViewMode: "list",
+  chatMode: "agent",
 };
 
 function readStoredSettings(): AppSettings {
@@ -42,6 +46,7 @@ function readStoredSettings(): AppSettings {
         parsed.sessionsViewMode === "grid" || parsed.sessionsViewMode === "list"
           ? parsed.sessionsViewMode
           : DEFAULT_SETTINGS.sessionsViewMode,
+      chatMode: isChatMode(parsed.chatMode) ? parsed.chatMode : DEFAULT_SETTINGS.chatMode,
     };
   } catch {
     return DEFAULT_SETTINGS;
@@ -88,6 +93,14 @@ export function useAppSettings() {
     });
   }, []);
 
+  const setChatMode = useCallback((chatMode: ChatMode) => {
+    setSettings((prev) => {
+      const next = { ...prev, chatMode };
+      writeStoredSettings(next);
+      return next;
+    });
+  }, []);
+
   return useMemo(
     () => ({
       interruptOnNewChat: settings.interruptOnNewChat,
@@ -96,12 +109,16 @@ export function useAppSettings() {
       setAutoResumeOnConnect,
       sessionsViewMode: settings.sessionsViewMode,
       setSessionsViewMode,
+      chatMode: settings.chatMode,
+      setChatMode,
     }),
     [
       settings.autoResumeOnConnect,
+      settings.chatMode,
       settings.interruptOnNewChat,
       settings.sessionsViewMode,
       setAutoResumeOnConnect,
+      setChatMode,
       setInterruptOnNewChat,
       setSessionsViewMode,
     ],

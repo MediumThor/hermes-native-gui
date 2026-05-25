@@ -1,4 +1,4 @@
-import { Check, Palette } from "lucide-react-native";
+import { Check, Moon, Palette, Sun } from "lucide-react-native";
 import { useMemo, useState } from "react";
 import { Pressable, ScrollView, StyleSheet, Text, View } from "react-native";
 import { BUILTIN_THEMES } from "../themes/presets";
@@ -102,6 +102,99 @@ function createStyles(colors: NativeThemeColors) {
       borderStyle: "dashed",
     },
   });
+}
+
+
+type SailDashMode = "light" | "dark";
+
+const SAILDASH_THEME_BY_MODE: Record<SailDashMode, string> = {
+  light: "saildash-light",
+  dark: "saildash-dark",
+};
+
+function activeSailDashMode(themeName: string): SailDashMode | null {
+  if (themeName === SAILDASH_THEME_BY_MODE.light) return "light";
+  if (themeName === SAILDASH_THEME_BY_MODE.dark) return "dark";
+  return null;
+}
+
+function createSailDashModeStyles(colors: NativeThemeColors, compact: boolean) {
+  return StyleSheet.create({
+    toggle: {
+      flexDirection: "row",
+      alignItems: "center",
+      gap: 3,
+      borderWidth: 1,
+      borderColor: colors.borderStrong,
+      backgroundColor: colors.surfaceElevated,
+      borderRadius: 999,
+      padding: 3,
+      shadowColor: "#000",
+      shadowOpacity: 0.20,
+      shadowRadius: 16,
+      shadowOffset: { width: 0, height: 8 },
+      elevation: 5,
+    },
+    option: {
+      flexDirection: "row",
+      alignItems: "center",
+      gap: 6,
+      borderWidth: 1,
+      borderColor: "transparent",
+      borderRadius: 999,
+      paddingHorizontal: compact ? 10 : 12,
+      paddingVertical: compact ? 7 : 9,
+    },
+    optionActive: {
+      backgroundColor: colors.success,
+      borderColor: colors.borderStrong,
+      shadowColor: colors.success,
+      shadowOpacity: 0.28,
+      shadowRadius: 12,
+      shadowOffset: { width: 0, height: 0 },
+      elevation: 4,
+    },
+    optionText: {
+      color: colors.midgroundMuted,
+      fontSize: compact ? 12 : 13,
+      fontWeight: "900",
+    },
+    optionTextActive: {
+      color: colors.onBackground,
+    },
+  });
+}
+
+export function SailDashModeSwitcher({ compact = false }: { compact?: boolean }) {
+  const { colors, themeName, setTheme } = useDashboardTheme();
+  const styles = useMemo(() => createSailDashModeStyles(colors, compact), [colors, compact]);
+  const activeMode = activeSailDashMode(themeName);
+
+  const renderOption = (mode: SailDashMode) => {
+    const active = activeMode === mode;
+    const Icon = mode === "light" ? Sun : Moon;
+    const label = mode === "light" ? "Light" : "Dark";
+    return (
+      <Pressable
+        key={mode}
+        style={[styles.option, active && styles.optionActive]}
+        onPress={() => setTheme(SAILDASH_THEME_BY_MODE[mode])}
+        accessibilityRole="button"
+        accessibilityState={{ selected: active }}
+        accessibilityLabel={"Switch to SailDash " + label}
+      >
+        <Icon color={active ? colors.onBackground : colors.midgroundMuted} size={compact ? 14 : 15} />
+        <Text style={[styles.optionText, active && styles.optionTextActive]}>{label}</Text>
+      </Pressable>
+    );
+  };
+
+  return (
+    <View style={styles.toggle} accessibilityRole="tablist" accessibilityLabel="SailDash color mode">
+      {renderOption("light")}
+      {renderOption("dark")}
+    </View>
+  );
 }
 
 export function ThemeSwitcher() {

@@ -64,6 +64,39 @@ Equivalent:
 node bin/hermes-native-gui.js --dev
 ```
 
+## Launching from Hermes
+
+You can start this project from any shell, including Hermes Agent's `terminal` tool. There is no built-in Hermes CLI command for it yet.
+
+### What works today
+
+From this checkout (after `npm install`):
+
+```bash
+cd ~/Desktop/hermes-native-gui
+npm run dev          # Expo dev server on http://localhost:19006
+npm run serve        # static build on http://127.0.0.1:8765 (run build:web first)
+```
+
+The launcher auto-detects Hermes at `~/.hermes/hermes-agent`, starts or reuses the bridge on port `8766`, and prints a browser URL with `?bridgeToken=...`. Open that URL to connect.
+
+From Hermes Agent chat, ask it to run the same command with **`background=true`** — this is a long-running dev server, not a one-shot shell command:
+
+```bash
+cd ~/Desktop/hermes-native-gui && npm run dev
+```
+
+Hermes will not open the browser for you; copy the printed URL (including the bridge token) into your browser.
+
+### What is not available yet
+
+| Approach | Status |
+| --- | --- |
+| `npm run dev` / `npm run serve` from a shell or Hermes terminal tool | Works from this checkout |
+| `npx hermes-native-gui` | Not published to npm yet — use this repo or `node bin/hermes-native-gui.js` |
+| `hermes gui` | Planned; not in Hermes CLI today |
+| `hermes dashboard` / `hermes --tui` | Separate products — they use the PTY/xterm path, not this native GUI |
+
 ## Configuration
 
 Environment variables:
@@ -111,6 +144,36 @@ Verify the security baseline:
 npm run serve
 npm run verify:security
 ```
+
+Verify that Hermes tool execution still works through the native GUI bridge (this creates temporary Hermes sessions and uses your configured model):
+
+```bash
+# in one terminal
+HERMES_NATIVE_GUI_WEB_PORT=8875 HERMES_NATIVE_GUI_BRIDGE_PORT=8876 npm run serve
+
+# in another terminal
+HERMES_NATIVE_GUI_BRIDGE_PORT=8876 npm run verify:tools
+```
+
+The tool smoke test requires the `browser` and `computer_use` toolsets to be enabled. Set `HERMES_NATIVE_GUI_SKIP_COMPUTER_SMOKE=1` if you only want to verify browser automation.
+
+## Fleet Mission Control
+
+When multiple Hermes sessions are running in parallel, open **Fleet Mission Control** from the main menu to:
+
+- see all running, blocked, and recently completed sessions in one dashboard
+- send a prompt to a specific session via the target selector
+- spawn a **New agent** (`session.create` + `prompt.submit`) without switching away from the fleet view
+- stop individual sessions, respond to blocked approvals/clarifications, and review mission summaries
+
+Entry points:
+
+- Main menu → **Fleet Mission Control**
+- Chat banner when more than one session is running
+
+Session-scoped **Mission Control** (subagent delegation inside one chat) remains separate and opens automatically during delegation within the active chat.
+
+Direct prompt-to-subagent is intentionally not supported in the GUI until Hermes exposes a first-class gateway API for it.
 
 ## Architecture
 

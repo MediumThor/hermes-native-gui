@@ -8,6 +8,10 @@ export type SessionTrackerSnapshot = {
   sessionKeyByGatewayId: Record<string, string>;
   gatewayIdBySessionKey: Record<string, string>;
   knownGatewayIds: string[];
+  /** Sessions opened or prompted from this GUI — used to filter Fleet Mission Control. */
+  guiTrackedSessionIds?: string[];
+  /** Short purpose labels derived from the first user prompt per session. */
+  sessionPurposeTitles?: Record<string, string>;
   lastActiveDbSessionKey?: string;
   lastActiveGatewaySessionId?: string;
 };
@@ -35,6 +39,17 @@ export function loadSessionTracker(): SessionTrackerSnapshot | null {
       knownGatewayIds: Array.isArray(parsed.knownGatewayIds)
         ? parsed.knownGatewayIds.map(String).filter(Boolean)
         : [],
+      guiTrackedSessionIds: Array.isArray(parsed.guiTrackedSessionIds)
+        ? parsed.guiTrackedSessionIds.map(String).filter(Boolean)
+        : [],
+      sessionPurposeTitles:
+        parsed.sessionPurposeTitles && typeof parsed.sessionPurposeTitles === "object"
+          ? Object.fromEntries(
+              Object.entries(parsed.sessionPurposeTitles)
+                .map(([key, value]) => [String(key), String(value ?? "").trim()])
+                .filter(([, value]) => value),
+            )
+          : {},
       lastActiveDbSessionKey:
         typeof parsed.lastActiveDbSessionKey === "string" ? parsed.lastActiveDbSessionKey : undefined,
       lastActiveGatewaySessionId:

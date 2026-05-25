@@ -8,12 +8,12 @@ body,
 #root {
   min-height: 100%;
   margin: 0;
-  background: #05070a;
+  background: var(--hermes-page-background, #05070a);
 }
 
 * {
   scrollbar-width: thin;
-  scrollbar-color: #000000 transparent;
+  scrollbar-color: var(--hermes-scrollbar-thumb, #000000) transparent;
 }
 
 *::-webkit-scrollbar {
@@ -26,12 +26,12 @@ body,
 }
 
 *::-webkit-scrollbar-thumb {
-  background-color: #000000;
+  background-color: var(--hermes-scrollbar-thumb, #000000);
   border-radius: 999px;
 }
 
 *::-webkit-scrollbar-thumb:hover {
-  background-color: #000000;
+  background-color: var(--hermes-scrollbar-thumb-hover, #000000);
 }
 
 *::-webkit-scrollbar-corner {
@@ -39,8 +39,16 @@ body,
 }
 `.trim();
 
-export function injectWebScrollbarStyles() {
+export function injectWebScrollbarStyles(background?: string, scrollbarThumb?: string) {
   if (Platform.OS !== "web" || typeof document === "undefined") return;
+
+  if (background) {
+    document.documentElement.style.setProperty("--hermes-page-background", background);
+  }
+  if (scrollbarThumb) {
+    document.documentElement.style.setProperty("--hermes-scrollbar-thumb", scrollbarThumb);
+    document.documentElement.style.setProperty("--hermes-scrollbar-thumb-hover", scrollbarThumb);
+  }
 
   if (document.getElementById(STYLE_ID)) return;
 

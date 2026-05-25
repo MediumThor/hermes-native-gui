@@ -19,22 +19,30 @@ export type ApprovalChoice = "once" | "session" | "always" | "deny";
 export interface ApprovalReq {
   command: string;
   description: string;
+  sessionId?: string;
+  attentionId?: string;
 }
 
 export interface ClarifyReq {
   question: string;
   choices: string[] | null;
   requestId: string;
+  sessionId?: string;
+  attentionId?: string;
 }
 
 export interface SudoReq {
   requestId: string;
+  sessionId?: string;
+  attentionId?: string;
 }
 
 export interface SecretReq {
   envVar: string;
   prompt: string;
   requestId: string;
+  sessionId?: string;
+  attentionId?: string;
 }
 
 export interface OverlayState {
@@ -110,6 +118,8 @@ export type SessionSummary = {
   title: string;
   preview: string;
   started_at: number;
+  /** Unix timestamp of the most recent assistant reply, when known. */
+  last_response_at: number;
   message_count: number;
   source: string;
 };

@@ -1,17 +1,24 @@
-import { ChevronDown, ChevronRight, Square } from "lucide-react-native";
+import { ClipboardCopy, FileText, GitBranch, PackageOpen, Square } from "lucide-react-native";
 import type { ReactNode } from "react";
 import { useEffect, useMemo, useState } from "react";
 import { Pressable, ScrollView, StyleSheet, Text, View } from "react-native";
 import type { SubagentNode, SubagentProgress, SubagentStatus } from "../subagentTypes";
-import { fmtDuration, formatSummary, treeTotals } from "../subagentTree";
-import { isActiveSubagentStatus } from "../subagentReducer";
+import { formatSummary, treeTotals } from "../subagentTree";
+import {
+  buildMissionTimeline,
+  collectMissionArtifacts,
+  type MissionSummary,
+} from "../missionTimeline";
 import { MiniBadge, SecondaryButton } from "./DashboardPrimitives";
 import { ReasoningDropdown } from "./ReasoningDropdown";
+import { SubagentTreeNode } from "./SubagentTreeNode";
 import { useDashboardTheme } from "../themes/DashboardThemeProvider";
 import type { NativeThemeColors } from "../themes/types";
 
 type Props = {
   tree: SubagentNode[];
+  subagents: SubagentProgress[];
+  missionSummary?: MissionSummary | null;
   status: string;
   busy: boolean;
   liveReasoning?: string;
@@ -21,12 +28,11 @@ type Props = {
   composer?: ReactNode;
 };
 
-const STATUS_LABEL: Record<SubagentStatus, string> = {
-  queued: "Queued",
+const STATUS_LABEL: Record<MissionSummary["status"], string> = {
+  completed: "Completed",
   running: "Running",
-  completed: "Done",
-  failed: "Failed",
   interrupted: "Stopped",
+  failed: "Failed",
 };
 
 function statusColorFor(colors: NativeThemeColors, status: SubagentStatus): string {
@@ -40,136 +46,20 @@ function statusColorFor(colors: NativeThemeColors, status: SubagentStatus): stri
   return map[status];
 }
 
-function elapsedSeconds(item: SubagentProgress, nowMs: number): number | null {
-  if (item.durationSeconds != null) return item.durationSeconds;
-  if (item.startedAt != null && isActiveSubagentStatus(item.status)) {
-    return Math.max(0, (nowMs - item.startedAt) / 1000);
-  }
-  return null;
+function copyToClipboard(text: string) {
+  const clipboard = typeof navigator !== "undefined" ? navigator.clipboard : null;
+  if (!clipboard || !text.trim()) return;
+  void clipboard.writeText(text);
 }
 
-function SubagentTreeNode({
-  node,
-  depth,
-  nowMs,
-  defaultExpanded,
-}: {
-  node: SubagentNode;
-  depth: number;
-  nowMs: number;
-  defaultExpanded?: boolean;
-}) {
-  const { colors } = useDashboardTheme();
-  const styles = useMemo(() => createStyles(colors), [colors]);
-  const [expanded, setExpanded] = useState(defaultExpanded ?? depth === 0);
-  const item = node.item;
-  const elapsed = elapsedSeconds(item, nowMs);
-  const hasDetails =
-    item.thinking.length > 0 ||
-    item.tools.length > 0 ||
-    item.notes.length > 0 ||
-    Boolean(item.summary) ||
-    node.children.length > 0;
-
-  return (
-    <View style={[styles.nodeBlock, depth > 0 && styles.nodeNested]}>
-      <Pressable
-        style={styles.nodeHeader}
-        onPress={() => hasDetails && setExpanded((open) => !open)}
-        disabled={!hasDetails}
-      >
-        <View style={styles.nodeHeaderLeft}>
-          {hasDetails ? (
-            expanded ? (
-              <ChevronDown color={colors.success} size={16} />
-            ) : (
-              <ChevronRight color={colors.success} size={16} />
-            )
-          ) : (
-            <View style={styles.nodeSpacer} />
-          )}
-          <View style={[styles.statusDot, { backgroundColor: statusColorFor(colors, item.status) }]} />
-          <View style={styles.nodeTextWrap}>
-            <Text selectable style={styles.nodeGoal} numberOfLines={expanded ? undefined : 2}>
-              {item.goal || "Subagent"}
-            </Text>
-            <Text selectable style={styles.nodeMeta}>
-              {STATUS_LABEL[item.status]}
-              {item.model ? ` · ${item.model}` : ""}
-              {elapsed != null ? ` · ${fmtDuration(elapsed)}` : ""}
-              {node.aggregate.totalTools > 0 ? ` · ${node.aggregate.totalTools} tools` : ""}
-              {node.children.length > 0 ? ` · ${node.children.length} child${node.children.length === 1 ? "" : "ren"}` : ""}
-            </Text>
-          </View>
-        </View>
-        {node.aggregate.activeCount > 0 ? (
-          <MiniBadge label={`${node.aggregate.activeCount} active`} active />
-        ) : null}
-      </Pressable>
-
-      {expanded ? (
-        <View style={styles.nodeBody}>
-          {item.thinking.length > 0 ? (
-            <View style={styles.detailSection}>
-              <Text style={styles.detailLabel}>Thinking</Text>
-              {item.thinking.slice(-6).map((line, index) => (
-                <Text key={`${item.id}-thinking-${index}`} selectable style={styles.detailText}>
-                  {line}
-                </Text>
-              ))}
-            </View>
-          ) : null}
-
-          {item.tools.length > 0 ? (
-            <View style={styles.detailSection}>
-              <Text style={styles.detailLabel}>Tools</Text>
-              {item.tools.slice(-8).map((line, index) => (
-                <Text key={`${item.id}-tool-${index}`} selectable style={styles.toolLine}>
-                  {line}
-                </Text>
-              ))}
-            </View>
-          ) : null}
-
-          {item.notes.length > 0 ? (
-            <View style={styles.detailSection}>
-              <Text style={styles.detailLabel}>Progress</Text>
-              {item.notes.slice(-4).map((line, index) => (
-                <Text key={`${item.id}-note-${index}`} selectable style={styles.detailText}>
-                  {line}
-                </Text>
-              ))}
-            </View>
-          ) : null}
-
-          {item.summary ? (
-            <View style={styles.detailSection}>
-              <Text style={styles.detailLabel}>Summary</Text>
-              <Text selectable style={styles.summaryText}>{item.summary}</Text>
-            </View>
-          ) : null}
-
-          {node.children.length > 0 ? (
-            <View style={styles.childTree}>
-              {node.children.map((child) => (
-                <SubagentTreeNode
-                  key={child.item.id}
-                  node={child}
-                  depth={depth + 1}
-                  nowMs={nowMs}
-                  defaultExpanded={child.aggregate.activeCount > 0}
-                />
-              ))}
-            </View>
-          ) : null}
-        </View>
-      ) : null}
-    </View>
-  );
+function statusLabel(status: MissionSummary["status"]) {
+  return STATUS_LABEL[status] ?? status;
 }
 
 export function MissionControlView({
   tree,
+  subagents,
+  missionSummary,
   status,
   busy,
   liveReasoning,
@@ -182,6 +72,31 @@ export function MissionControlView({
   const styles = useMemo(() => createStyles(colors), [colors]);
   const [nowMs, setNowMs] = useState(Date.now());
   const totals = useMemo(() => treeTotals(tree), [tree]);
+  const timeline = useMemo(() => buildMissionTimeline(subagents), [subagents]);
+  const visibleTimeline = useMemo(() => timeline.slice(-12), [timeline]);
+  const artifacts = useMemo(() => collectMissionArtifacts(subagents), [subagents]);
+  const failureSummaries = useMemo(
+    () => subagents
+      .filter((agent) => agent.status === "failed" || agent.status === "interrupted")
+      .map((agent) => (agent.goal || agent.id) + ": " + (agent.summary || agent.status)),
+    [subagents],
+  );
+  const artifactCopyText = useMemo(() => [
+    "Files read:",
+    ...(artifacts.filesRead.length ? artifacts.filesRead : ["None"]),
+    "",
+    "Files written:",
+    ...(artifacts.filesWritten.length ? artifacts.filesWritten : ["None"]),
+    "",
+    "Tools:",
+    ...(artifacts.tools.length ? artifacts.tools : ["None"]),
+    "",
+    "Summaries:",
+    ...(artifacts.summaries.length ? artifacts.summaries : ["None"]),
+    "",
+    "Failures:",
+    ...(failureSummaries.length ? failureSummaries : ["None"]),
+  ].join("\n"), [artifacts, failureSummaries]);
 
   useEffect(() => {
     const timer = setInterval(() => setNowMs(Date.now()), 1000);
@@ -220,6 +135,113 @@ export function MissionControlView({
               placeholder="The lead agent's reasoning stream will appear here while it delegates work."
               defaultOpen={Boolean(liveReasoning?.trim())}
             />
+          </View>
+        ) : null}
+
+        {missionSummary ? (
+          <View style={styles.resultCard}>
+            <View style={styles.sectionHeaderRow}>
+              <View style={styles.sectionTitleRow}>
+                <FileText color={colors.success} size={17} />
+                <Text selectable style={styles.sectionTitle}>Mission summary</Text>
+              </View>
+              <MiniBadge label={statusLabel(missionSummary.status)} active={missionSummary.status === "running"} />
+            </View>
+            <Text selectable style={styles.resultStats}>
+              {missionSummary.agentCount} agents · {missionSummary.toolCount} tools · {missionSummary.filesTouched} files touched
+            </Text>
+            <Text selectable style={styles.summaryText}>{missionSummary.summaryText}</Text>
+            <View style={styles.actionRow}>
+              <Pressable
+                style={styles.copyButton}
+                onPress={() => copyToClipboard(missionSummary.summaryText)}
+                accessibilityRole="button"
+                accessibilityLabel="Copy mission summary"
+              >
+                <ClipboardCopy color={colors.midground} size={14} />
+                <Text style={styles.copyText}>Copy summary</Text>
+              </Pressable>
+            </View>
+          </View>
+        ) : null}
+
+        {subagents.length > 0 ? (
+          <View style={styles.artifactCard}>
+            <View style={styles.sectionHeaderRow}>
+              <View style={styles.sectionTitleRow}>
+                <PackageOpen color={colors.success} size={17} />
+                <Text selectable style={styles.sectionTitle}>Artifacts</Text>
+              </View>
+              <View style={styles.actionRow}>
+                <Text selectable style={styles.resultStats}>
+                  {artifacts.failureCount} failures · {artifacts.summaries.length} summaries
+                </Text>
+                <Pressable
+                  style={styles.copyButton}
+                  onPress={() => copyToClipboard(artifactCopyText)}
+                  accessibilityRole="button"
+                  accessibilityLabel="Copy artifact inventory"
+                >
+                  <ClipboardCopy color={colors.midground} size={14} />
+                  <Text style={styles.copyText}>Copy artifacts</Text>
+                </Pressable>
+              </View>
+            </View>
+            <View style={styles.artifactGrid}>
+              <View style={styles.artifactColumn}>
+                <Text selectable style={styles.detailLabel}>Files read</Text>
+                {(artifacts.filesRead.length ? artifacts.filesRead : ["None yet"]).slice(0, 8).map((file) => (
+                  <Text key={`read-${file}`} selectable style={styles.toolLine}>{file}</Text>
+                ))}
+              </View>
+              <View style={styles.artifactColumn}>
+                <Text selectable style={styles.detailLabel}>Files written</Text>
+                {(artifacts.filesWritten.length ? artifacts.filesWritten : ["None yet"]).slice(0, 8).map((file) => (
+                  <Text key={`written-${file}`} selectable style={styles.toolLine}>{file}</Text>
+                ))}
+              </View>
+              <View style={styles.artifactColumn}>
+                <Text selectable style={styles.detailLabel}>Tools</Text>
+                {(artifacts.tools.length ? artifacts.tools : ["None yet"]).slice(0, 8).map((tool) => (
+                  <Text key={"tool-" + tool} selectable style={styles.toolLine}>{tool}</Text>
+                ))}
+              </View>
+              <View style={styles.artifactColumn}>
+                <Text selectable style={styles.detailLabel}>Summaries</Text>
+                {(artifacts.summaries.length ? artifacts.summaries : ["None yet"]).slice(0, 4).map((summary, index) => (
+                  <Text key={"summary-" + index} selectable style={styles.detailText} numberOfLines={3}>{summary}</Text>
+                ))}
+              </View>
+              <View style={styles.artifactColumn}>
+                <Text selectable style={styles.detailLabel}>Failures</Text>
+                {(failureSummaries.length ? failureSummaries : ["None yet"]).slice(0, 4).map((failure, index) => (
+                  <Text key={"failure-" + index} selectable style={styles.detailText} numberOfLines={3}>{failure}</Text>
+                ))}
+              </View>
+            </View>
+          </View>
+        ) : null}
+
+        {timeline.length > 0 ? (
+          <View style={styles.timelineCard}>
+            <View style={styles.sectionHeaderRow}>
+              <View style={styles.sectionTitleRow}>
+                <GitBranch color={colors.success} size={17} />
+                <Text selectable style={styles.sectionTitle}>Timeline</Text>
+              </View>
+              <Text selectable style={styles.resultStats}>
+                {visibleTimeline.length} of {timeline.length} events
+              </Text>
+            </View>
+            {visibleTimeline.map((entry) => (
+              <View key={entry.id} style={styles.timelineItem}>
+                <View style={[styles.statusDot, { backgroundColor: statusColorFor(colors, entry.status) }]} />
+                <View style={styles.timelineText}>
+                  <Text selectable style={styles.timelineTitle}>{entry.title}</Text>
+                  <Text selectable style={styles.detailText} numberOfLines={3}>{entry.detail}</Text>
+                </View>
+              </View>
+            ))}
           </View>
         ) : null}
 
@@ -290,6 +312,58 @@ function createStyles(colors: NativeThemeColors) {
     textTransform: "uppercase",
     letterSpacing: 0.6,
   },
+  resultCard: {
+    borderWidth: 1,
+    borderColor: colors.borderStrong,
+    borderRadius: 16,
+    backgroundColor: colors.accent,
+    padding: 16,
+    gap: 10,
+  },
+  artifactCard: {
+    borderWidth: 1,
+    borderColor: colors.border,
+    borderRadius: 16,
+    backgroundColor: colors.surfaceElevated,
+    padding: 16,
+    gap: 12,
+  },
+  timelineCard: {
+    borderWidth: 1,
+    borderColor: colors.border,
+    borderRadius: 16,
+    backgroundColor: colors.surfaceElevated,
+    padding: 16,
+    gap: 12,
+  },
+  sectionHeaderRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    gap: 12,
+    flexWrap: "wrap",
+  },
+  sectionTitleRow: { flexDirection: "row", alignItems: "center", gap: 8 },
+  sectionTitle: { color: colors.midground, fontSize: 15, fontWeight: "900" },
+  resultStats: { color: colors.midgroundFaint, fontSize: 12, lineHeight: 18 },
+  actionRow: { flexDirection: "row", gap: 8, flexWrap: "wrap" },
+  copyButton: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 6,
+    borderWidth: 1,
+    borderColor: colors.borderStrong,
+    backgroundColor: colors.surfaceElevated,
+    borderRadius: 10,
+    paddingHorizontal: 10,
+    paddingVertical: 7,
+  },
+  copyText: { color: colors.midground, fontSize: 12, fontWeight: "800" },
+  artifactGrid: { flexDirection: "row", gap: 12, flexWrap: "wrap" },
+  artifactColumn: { flex: 1, minWidth: 220, gap: 6 },
+  timelineItem: { flexDirection: "row", gap: 10, alignItems: "flex-start" },
+  timelineText: { flex: 1, minWidth: 0, gap: 3 },
+  timelineTitle: { color: colors.midground, fontSize: 13, fontWeight: "800" },
   nodeBlock: {
     borderWidth: 1,
     borderColor: colors.border,

@@ -28,7 +28,9 @@
     "prepack": "npm run build:web",
     "serve": "node bin/hermes-native-gui.js --no-open",
     "verify:security": "node scripts/verify-bridge-security.mjs",
-    "typecheck": "tsc --noEmit"
+    "test:unit": "node scripts/run-unit-tests.mjs",
+    "typecheck": "tsc --noEmit",
+    "verify:tools": "node scripts/verify-browser-computer-tools.mjs"
   },
   "dependencies": {
     "@expo/metro-runtime": "~6.1.2",

@@ -1,8 +1,9 @@
 import { RefreshCw } from "lucide-react-native";
-import type { ReactNode } from "react";
-import { ActivityIndicator, Platform, Pressable, ScrollView, Text, View } from "react-native";
+import { useMemo, type ReactNode } from "react";
+import { ActivityIndicator, Modal, Pressable, ScrollView, StyleSheet, Text, View } from "react-native";
 import type { BridgeDataStatus } from "../bridgeContracts";
 import { useDashboardTheme } from "../themes/DashboardThemeProvider";
+import type { NativeThemeColors } from "../themes/types";
 
 export function PaneScroll({ children }: { children: ReactNode }) {
   const { styles } = useDashboardTheme();
@@ -135,6 +136,109 @@ export function MiniBadge({ label, active }: { label: string; active?: boolean }
       <Text style={[styles.miniBadgeText, active && styles.miniBadgeTextOn]}>{label}</Text>
     </View>
   );
+}
+
+export function PortalModal({
+  visible,
+  title,
+  subtitle,
+  children,
+  footer,
+  onClose,
+}: {
+  visible: boolean;
+  title: string;
+  subtitle?: string;
+  children: ReactNode;
+  footer?: ReactNode;
+  onClose: () => void;
+}) {
+  const { colors } = useDashboardTheme();
+  const modalStyles = useMemo(() => createModalStyles(colors), [colors]);
+  return (
+    <Modal visible={visible} transparent animationType="fade" onRequestClose={onClose}>
+      <View style={modalStyles.portalRoot}>
+        <Pressable style={modalStyles.backdrop} onPress={onClose} accessibilityRole="button" accessibilityLabel="Close modal" />
+        <View style={modalStyles.sheet}>
+          <View style={modalStyles.header}>
+            <View style={modalStyles.headerText}>
+              <Text selectable style={modalStyles.title}>{title}</Text>
+              {subtitle ? <Text selectable style={modalStyles.subtitle}>{subtitle}</Text> : null}
+            </View>
+            <Pressable style={modalStyles.closeButton} onPress={onClose} accessibilityRole="button" accessibilityLabel="Close modal">
+              <Text style={modalStyles.closeText}>×</Text>
+            </Pressable>
+          </View>
+          <ScrollView style={modalStyles.body} contentContainerStyle={modalStyles.bodyContent} keyboardShouldPersistTaps="handled">
+            {children}
+          </ScrollView>
+          {footer ? <View style={modalStyles.footer}>{footer}</View> : null}
+        </View>
+      </View>
+    </Modal>
+  );
+}
+
+function createModalStyles(colors: NativeThemeColors) {
+  return StyleSheet.create({
+    portalRoot: {
+      flex: 1,
+      justifyContent: "center",
+      alignItems: "center",
+      padding: 24,
+    },
+    backdrop: {
+      ...StyleSheet.absoluteFillObject,
+      backgroundColor: colors.overlay,
+    },
+    sheet: {
+      width: "100%",
+      maxWidth: 980,
+      maxHeight: "88%",
+      borderWidth: 1,
+      borderColor: colors.borderStrong,
+      borderRadius: 24,
+      backgroundColor: colors.surfaceElevated,
+      overflow: "hidden",
+      shadowColor: "#000",
+      shadowOpacity: 0.35,
+      shadowRadius: 32,
+      shadowOffset: { width: 0, height: 18 },
+      elevation: 16,
+    },
+    header: {
+      flexDirection: "row",
+      alignItems: "flex-start",
+      justifyContent: "space-between",
+      gap: 16,
+      padding: 22,
+      borderBottomWidth: 1,
+      borderBottomColor: colors.border,
+      backgroundColor: colors.surface,
+    },
+    headerText: { flex: 1, minWidth: 0, gap: 4 },
+    title: { color: colors.midground, fontSize: 22, fontWeight: "900" },
+    subtitle: { color: colors.midgroundFaint, lineHeight: 20 },
+    closeButton: {
+      width: 36,
+      height: 36,
+      borderRadius: 12,
+      borderWidth: 1,
+      borderColor: colors.border,
+      alignItems: "center",
+      justifyContent: "center",
+      backgroundColor: colors.surfaceElevated,
+    },
+    closeText: { color: colors.midground, fontSize: 24, fontWeight: "800", lineHeight: 28 },
+    body: { maxHeight: 640 },
+    bodyContent: { padding: 22, gap: 16 },
+    footer: {
+      padding: 16,
+      borderTopWidth: 1,
+      borderTopColor: colors.border,
+      backgroundColor: colors.surface,
+    },
+  });
 }
 
 /** @deprecated Use useDashboardTheme().styles instead */

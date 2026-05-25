@@ -3,6 +3,7 @@ import { Check, LayoutGrid, LayoutList, RefreshCw, Trash2 } from "lucide-react-n
 import { ActivityIndicator, Pressable, ScrollView, StyleSheet, Text, View } from "react-native";
 import type { SessionsViewMode } from "../useAppSettings";
 import type { SessionRuntimeState, SessionSummary } from "../types";
+import { dedupeSessionList, type DedupedSessionSummary } from "../sessionListDedup";
 import { SessionStatusBadge } from "./SessionStatusBadge";
 import { useDashboardTheme } from "../themes/DashboardThemeProvider";
 import type { NativeThemeColors } from "../themes/types";
@@ -20,6 +21,7 @@ type Props = {
   connected: boolean;
   sessionSwitchDisabled: boolean;
   canSwitchToSession: (sessionId: string) => boolean;
+  liveResponseAt?: Record<string, number>;
   viewMode: SessionsViewMode;
   onViewModeChange: (mode: SessionsViewMode) => void;
   onRefresh: () => void;
@@ -28,7 +30,7 @@ type Props = {
 };
 
 type SessionCardProps = {
-  session: SessionSummary;
+  session: DedupedSessionSummary;
   runtime: SessionRuntimeState | undefined;
   active: boolean;
   disabled: boolean;
@@ -40,16 +42,42 @@ type SessionCardProps = {
   onDeleteSession?: (sessionId: string) => void;
 };
 
+function sessionLastResponseAt(
+  session: SessionSummary,
+  resolveSessionRuntime: (sessionId: string) => SessionRuntimeState | undefined,
+  liveResponseAt: Record<string, number>,
+): number {
+  const runtime = resolveSessionRuntime(session.id);
+  const base = Math.max(
+    liveResponseAt[session.id] ?? 0,
+    session.last_response_at ?? 0,
+    session.started_at ?? 0,
+  );
+  if (runtime?.running) return Math.max(base, runtime.updatedAt ?? 0);
+  return base;
+}
+
 function sessionSortScore(
   session: SessionSummary,
-  activeDbSessionId: string | null,
-  activeGatewaySessionId: string | null,
   resolveSessionRuntime: (sessionId: string) => SessionRuntimeState | undefined,
 ) {
   const runtime = resolveSessionRuntime(session.id);
   if (runtime?.running) return 0;
-  if (session.id === activeDbSessionId || session.id === activeGatewaySessionId) return 1;
-  return 2;
+  return 1;
+}
+
+function sessionIsActive(
+  sessionId: string,
+  activeGatewaySessionId: string | null,
+  activeDbSessionId: string | null,
+  sessionKeyByGatewayId: Record<string, string>,
+  gatewayIdBySessionKey: Record<string, string>,
+): boolean {
+  if (!activeGatewaySessionId && !activeDbSessionId) return false;
+  if (sessionId === activeGatewaySessionId || sessionId === activeDbSessionId) return true;
+  if (activeGatewaySessionId && sessionKeyByGatewayId[activeGatewaySessionId] === sessionId) return true;
+  if (activeDbSessionId && gatewayIdBySessionKey[sessionId] === activeGatewaySessionId) return true;
+  return false;
 }
 
 function countRunningSessions(
@@ -66,6 +94,15 @@ function countRunningSessions(
     count += 1;
   }
   return count;
+}
+
+function sessionSwitchTarget(
+  sessionId: string,
+  listedIds: Set<string>,
+  gatewayIdBySessionKey: Record<string, string>,
+): string {
+  if (listedIds.has(sessionId)) return sessionId;
+  return gatewayIdBySessionKey[sessionId] ?? sessionId;
 }
 
 function SessionCard({
@@ -99,7 +136,7 @@ function SessionCard({
       onPress={() => {
         onSelectSession(switchTarget);
       }}
-      disabled={cardDisabled && !active}
+      disabled={cardDisabled}
     >
       <View style={styles.sessionCardHeader}>
         <Text selectable style={styles.sessionTitle} numberOfLines={grid ? 2 : 1}>
@@ -125,6 +162,9 @@ function SessionCard({
       </View>
       <Text selectable style={styles.sessionMeta}>
         {session.message_count} messages · {session.source || "session"} · {session.id.slice(0, 8)}
+        {session.duplicateCount && session.duplicateCount > 1
+          ? ` · ${session.duplicateCount} resume copies merged`
+          : ""}
       </Text>
       {runtime?.running && runtime.activity ? (
         <Text selectable style={styles.sessionActivity} numberOfLines={grid ? 3 : 2}>
@@ -186,6 +226,7 @@ export function SessionsSection({
   connected,
   sessionSwitchDisabled,
   canSwitchToSession,
+  liveResponseAt = {},
   viewMode,
   onViewModeChange,
   onRefresh,
@@ -195,7 +236,11 @@ export function SessionsSection({
   const { colors } = useDashboardTheme();
   const styles = useMemo(() => createStyles(colors), [colors]);
   const runningCount = countRunningSessions(sessionRuntime, sessionKeyByGatewayId);
-  const listedIds = new Set(sessions.map((session) => session.id));
+  const dedupedSessions = useMemo(
+    () => dedupeSessionList(sessions, resolveSessionRuntime),
+    [resolveSessionRuntime, sessions],
+  );
+  const listedIds = new Set(dedupedSessions.map((session) => session.id));
   const runningOnlySessions: SessionSummary[] = [];
   const seenRunning = new Set<string>();
   for (const [id, state] of Object.entries(sessionRuntime)) {
@@ -212,30 +257,36 @@ export function SessionsSection({
         : `Running session ${canonical.slice(0, 8)}`,
       preview: state.activity || "Agent running",
       started_at: state.updatedAt,
+      last_response_at: state.updatedAt,
       message_count: 0,
       source: "live",
     });
   }
-  const allSessions = [...runningOnlySessions, ...sessions];
+  const allSessions = [...runningOnlySessions, ...dedupedSessions];
   const sortedSessions = [...allSessions].sort((a, b) => {
     const scoreDiff =
-      sessionSortScore(a, activeDbSessionId, activeGatewaySessionId, resolveSessionRuntime) -
-      sessionSortScore(b, activeDbSessionId, activeGatewaySessionId, resolveSessionRuntime);
+      sessionSortScore(a, resolveSessionRuntime) -
+      sessionSortScore(b, resolveSessionRuntime);
     if (scoreDiff !== 0) return scoreDiff;
-    return b.started_at - a.started_at;
+    return (
+      sessionLastResponseAt(b, resolveSessionRuntime, liveResponseAt) -
+      sessionLastResponseAt(a, resolveSessionRuntime, liveResponseAt)
+    );
   });
 
   const sessionCards = sortedSessions.map((session) => {
     const runtime = resolveSessionRuntime(session.id);
-    const active =
-      session.id === activeDbSessionId ||
-      session.id === activeGatewaySessionId;
+    const active = sessionIsActive(
+      session.id,
+      activeGatewaySessionId,
+      activeDbSessionId,
+      sessionKeyByGatewayId,
+      gatewayIdBySessionKey,
+    );
     const disabled = sessionSwitchDisabled && !active;
-    const switchTarget = listedIds.has(session.id)
-      ? session.id
-      : gatewayIdBySessionKey[session.id] ?? session.id;
+    const switchTarget = sessionSwitchTarget(session.id, listedIds, gatewayIdBySessionKey);
     const deleteTarget = listedIds.has(session.id) ? session.id : null;
-    const cardDisabled = disabled || (!canSwitchToSession(switchTarget) && !runtime?.running);
+    const cardDisabled = disabled || !canSwitchToSession(switchTarget);
 
     return (
       <SessionCard
@@ -262,7 +313,7 @@ export function SessionsSection({
           <Text selectable style={styles.sectionSubtitle}>
             {runningCount > 0
               ? `${runningCount} agent${runningCount === 1 ? "" : "s"} running · ${allSessions.length} shown`
-              : `Tap a conversation to open it in chat. ${sessions.length} loaded.`}
+              : `Tap a conversation to open it in chat. ${dedupedSessions.length} shown${dedupedSessions.length < sessions.length ? ` (${sessions.length} loaded)` : ""}.`}
           </Text>
         </View>
         <View style={styles.headerActions}>

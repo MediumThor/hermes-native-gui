@@ -17,14 +17,22 @@ import { useAppSettings } from "./src/useAppSettings";
 import type { HermesSettingsState, ProviderOption, ToolsetSetting } from "./src/hermesSettings";
 import { DEFAULT_HERMES_SETTINGS, normalizeSettingsPayload } from "./src/hermesSettings";
 import { BlockingOverlays } from "./src/components/BlockingOverlays";
+import { ChatModeSelector } from "./src/components/ChatModeSelector";
+import { chatModeDefinition, formatSubmissionForChatMode } from "./src/chatModes";
+import { isComposerBusy, isPlainEnterKey } from "./src/promptDelivery";
+import { applySlashCompletionToDraft } from "./src/slashCompletion";
 import { ChatTranscript, DefaultEmptyTranscript } from "./src/components/ChatTranscript";
 import { ConfirmModal } from "./src/components/ConfirmModal";
 import { MainMenu, MAIN_MENU_WIDTH, type MainMenuPane } from "./src/components/MainMenu";
-import { RunningSessionBanner } from "./src/components/RunningSessionBanner";
+import { RunningSessionPill } from "./src/components/RunningSessionBanner";
 import { SessionsSection } from "./src/components/SessionsSection";
 import { SessionStatusBadge } from "./src/components/SessionStatusBadge";
+import { RunningAgentsPanel } from "./src/components/RunningAgentsPanel";
+import { ActivitySidebar } from "./src/components/ActivitySidebar";
 import { ToolActivityCard } from "./src/components/ToolActivityCard";
-import { MissionControlView } from "./src/components/MissionControlView";
+import { SailDashModeSwitcher } from "./src/components/ThemeSwitcher";
+import { FleetMissionControlView } from "./src/components/FleetMissionControlView";
+import { AttentionInbox } from "./src/components/AttentionInbox";
 import { PromptQueueStrip } from "./src/components/PromptQueueStrip";
 import { useBusyAwareSubmit } from "./src/useBusyAwareSubmit";
 import {
@@ -36,11 +44,12 @@ import type { SessionSummary, SlashCompletionResult, SlashCompletionItem } from 
 import { SettingsPane } from "./src/panes/SettingsPane";
 import { ModelsPane } from "./src/panes/ModelsPane";
 import { ToolsPane } from "./src/panes/ToolsPane";
+import { DoctorPane } from "./src/panes/DoctorPane";
 import { CommandsPane, CronPane, KeysPane, SystemPane } from "./src/panes/ResourcePanes";
 import { PluginsPane } from "./src/panes/PluginsPane";
 import { SkillsPane } from "./src/panes/SkillsPane";
 import { normalizeModelOptions, normalizePluginsList, normalizeSkillHubBrowse, normalizeSkillsList, normalizeToolsets, pluginRegistryName } from "./src/bridgeContracts";
-import type { PluginSummary, SkillHubBrowse, SkillHubItem, SkillSummary } from "./src/bridgeContracts";
+import type { DoctorStatusResponse, PluginSummary, SkillHubBrowse, SkillHubItem, SkillSummary } from "./src/bridgeContracts";
 import { DashboardThemeProvider, useDashboardTheme } from "./src/themes/DashboardThemeProvider";
 import { injectWebScrollbarStyles } from "./src/web/scrollbarStyles";
 
@@ -105,10 +114,11 @@ function sessionLabel(sessionId: string | null, sessions: SessionSummary[]) {
 }
 
 function App() {
-  const { colors, styles } = useDashboardTheme();
+  const { colors, styles, themeName } = useDashboardTheme();
   const settings = useAppSettings();
   const hermes = useHermesRpc({ autoResumeOnConnect: settings.autoResumeOnConnect });
   const [draft, setDraft] = useState("");
+  const [steeringQueue, setSteeringQueue] = useState(false);
   const [attachedImages, setAttachedImages] = useState<ImageAttachment[]>([]);
   const [attachmentMessage, setAttachmentMessage] = useState("");
   const [composerFocused, setComposerFocused] = useState(false);
@@ -117,7 +127,9 @@ function App() {
   const [switchConfirmVisible, setSwitchConfirmVisible] = useState(false);
   const [interruptDisableConfirmVisible, setInterruptDisableConfirmVisible] = useState(false);
   const [deleteConfirmVisible, setDeleteConfirmVisible] = useState(false);
+  const [fleetStopConfirmVisible, setFleetStopConfirmVisible] = useState(false);
   const [pendingDeleteSessionId, setPendingDeleteSessionId] = useState<string | null>(null);
+  const [pendingFleetStopSessionId, setPendingFleetStopSessionId] = useState<string | null>(null);
   const [pendingSwitch, setPendingSwitch] = useState<{ type: "new-chat" } | { type: "session"; sessionId: string } | null>(null);
   const [sessionsLoading, setSessionsLoading] = useState(false);
   const [hermesSettings, setHermesSettings] = useState<HermesSettingsState>(DEFAULT_HERMES_SETTINGS);
@@ -138,11 +150,11 @@ function App() {
   const [pluginsList, setPluginsList] = useState<PluginSummary[]>([]);
   const [pluginsSavingKey, setPluginsSavingKey] = useState<string | null>(null);
   const [pluginsRescanning, setPluginsRescanning] = useState(false);
+  const [doctorStatus, setDoctorStatus] = useState<DoctorStatusResponse | null>(null);
   const [profileInfo, setProfileInfo] = useState<any>(null);
   const [browserState, setBrowserState] = useState<any>(null);
   const [auxLoading, setAuxLoading] = useState(false);
   const [auxMessage, setAuxMessage] = useState("");
-  const [missionControlDismissed, setMissionControlDismissed] = useState(false);
   const [slashCompletions, setSlashCompletions] = useState<SlashCompletionResult>({ items: [] });
   const [slashCompletionOpen, setSlashCompletionOpen] = useState(false);
   const [slashMessage, setSlashMessage] = useState("");
@@ -151,9 +163,8 @@ function App() {
   const drawerProgress = useRef(new Animated.Value(0)).current;
 
   useEffect(() => {
-    if (!hermes.delegationActive) return;
-    setMissionControlDismissed(false);
-  }, [hermes.delegationActive]);
+    injectWebScrollbarStyles(colors.background, colors.borderStrong);
+  }, [colors.background, colors.borderStrong]);
 
   const refreshSessionsList = useCallback(async () => {
     if (!hermes.connected) return;
@@ -269,11 +280,7 @@ function App() {
   }, [composerFocused, draft, hermes.connected, hermes.getSlashCompletions]);
 
   const applySlashCompletion = (item: SlashCompletionItem) => {
-    const replaceFrom = slashCompletions.replace_from ?? (draft.includes(" ") ? draft.lastIndexOf(" ") + 1 : 1);
-    const prefix = draft.slice(0, replaceFrom);
-    const suffix = draft.slice(replaceFrom);
-    const completion = replaceFrom === 1 && item.text.startsWith("/") ? item.text.slice(1) : item.text;
-    setDraft(`${prefix}${completion}${suffix}`.trimEnd() + " ");
+    setDraft(applySlashCompletionToDraft(draft, item, slashCompletions.replace_from));
     setSlashCompletionOpen(false);
   };
 
@@ -283,14 +290,18 @@ function App() {
     setSlashCompletionOpen(false);
   };
 
+  const activeRuntime = hermes.sessionId
+    ? hermes.resolveSessionRuntime(hermes.activeDbSessionId ?? hermes.sessionId)
+    : undefined;
+  const composerBusy = isComposerBusy(hermes.busy, activeRuntime);
+
   const { submitDraft } = useBusyAwareSubmit({
-    busy: hermes.busy,
+    busy: composerBusy,
     isBlocked: hermes.isBlocked,
-    promptQueue: hermes.promptQueue,
     queuePrompt: hermes.queuePrompt,
-    steerNextQueuedPrompt: hermes.steerNextQueuedPrompt,
     sendPrompt: hermes.sendPrompt,
     interruptSession: hermes.interruptSession,
+    onInterruptArmed: hermes.hintInterruptArmed,
   });
 
   const submit = async () => {
@@ -298,7 +309,8 @@ function App() {
     const text = draft;
     const hasAttachments = attachedImages.length > 0;
     try {
-      if (text.trim().startsWith("/")) {
+      const trimmedText = text.trim();
+      if (trimmedText.startsWith("/") || trimmedText.toLowerCase().startsWith("terminal ")) {
         await submitSlashCommand(text);
         setDraft("");
         setAttachedImages([]);
@@ -306,7 +318,17 @@ function App() {
         return;
       }
 
-      const result = await submitDraft(text, { hasAttachments });
+      const formatted = formatSubmissionForChatMode(text, settings.chatMode);
+      if (formatted.kind === "slash") {
+        if (!formatted.payload.trim()) return;
+        await submitSlashCommand(formatted.payload);
+        setDraft("");
+        setAttachedImages([]);
+        setAttachmentMessage("");
+        return;
+      }
+
+      const result = await submitDraft(formatted.payload, { hasAttachments });
       if (result.action === "sent") {
         setDraft("");
         setAttachedImages([]);
@@ -328,7 +350,7 @@ function App() {
   };
 
   const stopTurn = async () => {
-    if (!hermes.connected || (!hermes.busy && !hermes.isBlocked)) return;
+    if (!hermes.connected || (!composerBusy && !hermes.isBlocked)) return;
     try {
       await hermes.interruptSession();
     } catch (error: any) {
@@ -350,6 +372,17 @@ function App() {
         <PromptQueueStrip
           items={hermes.promptQueue}
           onRemove={hermes.removeQueuedPromptAt}
+          sendingNow={steeringQueue}
+          onSendNow={() => {
+            void runSafely(async () => {
+              setSteeringQueue(true);
+              try {
+                await hermes.steerNextQueuedPrompt();
+              } finally {
+                setSteeringQueue(false);
+              }
+            });
+          }}
         />
       ) : null}
 
@@ -408,6 +441,12 @@ function App() {
         <Text selectable style={styles.slashMessage}>{slashMessage}</Text>
       ) : null}
 
+      <ChatModeSelector
+        mode={settings.chatMode}
+        disabled={!hermes.connected || hermes.isBlocked}
+        onChange={settings.setChatMode}
+      />
+
       <View style={styles.composer}>
         <TextInput
           style={styles.input}
@@ -419,27 +458,22 @@ function App() {
           placeholder={
             hermes.isBlocked
               ? "Respond to the prompt above…"
-              : hermes.busy
-                ? "Queue a follow-up… Enter twice (empty) sends next queued message now"
+            : composerBusy
+                ? "Queue a follow-up… Enter twice (empty) to stop the current turn"
                 : hermes.connected
-                  ? "Ask Hermes, type / for commands, or paste a screenshot…"
+                  ? chatModeDefinition(settings.chatMode).placeholder
                   : "Connect to the bridge first…"
           }
           placeholderTextColor={colors.midgroundMuted}
           editable={hermes.connected && !hermes.isBlocked}
           onKeyPress={(event) => {
             if (Platform.OS !== "web") return;
-
-            const native = event.nativeEvent as any;
-            if (native.key !== "Enter") return;
-
-            if (!native.shiftKey && !native.metaKey && !native.ctrlKey && !native.altKey) {
-              event.preventDefault?.();
-              void submit();
-            }
+            if (!isPlainEnterKey(event)) return;
+            event.preventDefault?.();
+            void submit();
           }}
         />
-        {hermes.busy && !hermes.isBlocked ? (
+        {composerBusy && !hermes.isBlocked ? (
           <Pressable
             style={styles.stopOnlyButton}
             onPress={() => void stopTurn()}
@@ -467,7 +501,7 @@ function App() {
             <Send color={colors.onBackground} size={18} />
           )}
           <Text style={[styles.sendText, hermes.isBlocked && styles.stopText]}>
-            {hermes.isBlocked ? "Stop" : hermes.busy ? "Queue" : "Send"}
+            {hermes.isBlocked ? "Stop" : composerBusy ? "Queue" : "Send"}
           </Text>
         </Pressable>
       </View>
@@ -478,7 +512,7 @@ function App() {
   const sessionSwitchDisabled = !hermes.connected;
   const newChatSubtitle = !hermes.connected
     ? "Connect to the bridge first"
-    : (hermes.busy || hermes.isBlocked)
+    : (composerBusy || hermes.isBlocked)
       ? "Start a separate chat while this one keeps running"
       : "Start a fresh session";
   const sessionsMenuDisabled = !hermes.connected;
@@ -602,6 +636,30 @@ function App() {
     }
   };
 
+  const applyToolPreset = async (label: string, names: string[]) => {
+    if (!hermes.connected) return;
+    const desired = new Set(names.filter((name) => toolsets.some((toolset) => toolset.name === name)));
+    const toEnable = toolsets.filter((toolset) => desired.has(toolset.name) && !toolset.enabled).map((toolset) => toolset.name);
+    const toDisable = toolsets.filter((toolset) => !desired.has(toolset.name) && toolset.enabled).map((toolset) => toolset.name);
+    if (!toEnable.length && !toDisable.length) {
+      setAuxMessage(`${label} preset is already applied.`);
+      return;
+    }
+    setSettingsSavingKey(`preset:${label}`);
+    setAuxMessage(`Applying ${label} preset…`);
+    try {
+      if (toEnable.length) await hermes.configureToolsets("enable", toEnable);
+      if (toDisable.length) await hermes.configureToolsets("disable", toDisable);
+      const tools = await hermes.listToolsets();
+      setToolsets(normalizeToolsets(tools));
+      setAuxMessage(`${label} preset applied. Active sessions may be reset by Hermes.`);
+    } catch (error: any) {
+      setAuxMessage(`Preset update failed: ${error?.message ?? "unknown error"}`);
+    } finally {
+      setSettingsSavingKey(null);
+    }
+  };
+
   const setVoiceMode = async (mode: "on" | "off" | "tts") => {
     if (!hermes.connected) return;
     setSettingsSavingKey(`voice:${mode}`);
@@ -647,7 +705,7 @@ function App() {
         setCronState(await hermes.request("cron.manage", { action: "list" }));
       } else if (pane === "skills") {
         const [installed, browse] = await Promise.all([
-          hermes.request("skills.listInstalled"),
+          hermes.request("skills.manage", { action: "list" }),
           hermes.request("skills.manage", { action: "browse", page: 1 }),
         ]);
         setSkillsState(normalizeSkillsList(installed));
@@ -666,6 +724,8 @@ function App() {
       } else if (pane === "tools") {
         const tools = await hermes.listToolsets();
         setToolsets(normalizeToolsets(tools));
+      } else if (pane === "doctor") {
+        setDoctorStatus(await hermes.request("doctor.status") as DoctorStatusResponse);
       }
       setAuxMessage("Loaded from Hermes bridge.");
     } catch (error: any) {
@@ -677,7 +737,7 @@ function App() {
 
   useEffect(() => {
     if (!hermes.connected) return;
-    if (["models", "tools", "keys", "system", "logs", "cron", "skills", "commands", "plugins"].includes(activePane)) {
+    if (["models", "tools", "keys", "system", "logs", "cron", "skills", "commands", "plugins", "doctor"].includes(activePane)) {
       void loadAuxiliaryData(activePane);
     }
   }, [activePane, hermes.connected, loadAuxiliaryData]);
@@ -838,7 +898,7 @@ function App() {
     if (pane === "settings" && hermes.connected) {
       void loadHermesSettings();
     }
-    if (["models", "tools", "keys", "system", "logs", "cron", "skills", "commands", "plugins"].includes(pane) && hermes.connected) {
+    if (["models", "tools", "keys", "system", "logs", "cron", "skills", "commands", "plugins", "doctor"].includes(pane) && hermes.connected) {
       void loadAuxiliaryData(pane);
     }
   };
@@ -877,7 +937,11 @@ function App() {
   };
 
   const openSession = (sessionId: string) => {
-    requestSwitch({ type: "session", sessionId });
+    setActivePane("chat");
+    setDrawerOpen(false);
+    void switchSession(() =>
+      hermes.focusSession(sessionId, { force: hermes.matchesActiveSession(sessionId) }),
+    );
   };
 
   const confirmSwitch = async () => {
@@ -919,9 +983,6 @@ function App() {
   const activeSession = hermes.sessions.find(
     (session) => session.id === hermes.sessionId || session.id === hermes.activeDbSessionId,
   );
-  const activeRuntime = hermes.sessionId
-    ? hermes.resolveSessionRuntime(hermes.activeDbSessionId ?? hermes.sessionId)
-    : undefined;
   const backgroundRunningRuntime = hermes.backgroundRunningSessionId
     ? hermes.resolveSessionRuntime(hermes.backgroundRunningSessionId)
     : undefined;
@@ -941,24 +1002,17 @@ function App() {
     ? backgroundRunningLabel
     : activeRunningLabel;
   const visibleRunningIsActive = !hermes.backgroundRunningSessionId && Boolean(activeRunningSessionId);
-  const showMissionControl =
-    activePane === "chat" && hermes.delegationActive && !missionControlDismissed;
+  const fleetActiveCount =
+    hermes.fleetSnapshot.runningCount + hermes.fleetSnapshot.blockedCount;
 
-  const chatPaneTitle = showMissionControl
-    ? "Mission Control"
-    : activeSession?.title?.trim() || "Chat";
-  const chatPaneSubtitle = showMissionControl
-    ? "Tracking delegated subagents, tools, and reasoning."
-    : activeRuntime?.running
-      ? activeRuntime.activity || "Hermes is working in this chat."
-      : activeSession?.preview?.trim()
-        || (hermes.sessionId ? `${hermes.messages.length} messages in this chat` : "Open Sessions to resume a chat or start a new one.");
-  const headerStatus = activeRuntime?.running
-    ? `Running in this chat · ${activeRuntime.activity || "Working…"}`
-    : hermes.backgroundRunningSessionId
-      ? hermes.status
-      : hermes.status;
-  const paneTitle = activePane === "chat" ? chatPaneTitle : ({
+
+  const chatPaneTitle = activeSession?.title?.trim() || "Chat";
+  const chatPaneSubtitle = activeRuntime?.running
+    ? activeRuntime.activity || "Hermes is working in this chat."
+    : activeSession?.preview?.trim()
+      || (hermes.sessionId ? `${hermes.messages.length} messages in this chat` : "Open Sessions to resume a chat or start a new one.");
+  const headerStatus = hermes.status;
+  const paneTitle = activePane === "chat" ? chatPaneTitle : activePane === "fleet" ? "Fleet Mission Control" : ({
     sessions: "Sessions",
     activity: "Activity",
     settings: "Settings",
@@ -967,25 +1021,29 @@ function App() {
     tools: "Tools",
     skills: "Skills",
     plugins: "Plugins",
+    doctor: "Doctor",
     cron: "Cron",
     keys: "Keys",
     system: "System",
     logs: "Runtime",
-  } as Record<Exclude<Pane, "chat">, string>)[activePane];
-  const paneSubtitle = activePane === "chat" ? chatPaneSubtitle : ({
+  } as Record<Exclude<Pane, "chat" | "fleet">, string>)[activePane as Exclude<Pane, "chat" | "fleet">];
+  const paneSubtitle = activePane === "chat" ? chatPaneSubtitle : activePane === "fleet"
+    ? `${fleetActiveCount} active ${fleetActiveCount === 1 ? "session" : "sessions"} · ${hermes.fleetSnapshot.sessions.length} tracked`
+    : ({
     sessions: "Pick a recent conversation to open it in chat.",
-    activity: "Inspect tool calls and runtime activity.",
+    activity: "Inspect tool calls, running agents, and runtime activity.",
     settings: "Bridge connection, models, toolsets, and session behavior.",
     commands: "Slash command catalog and autocomplete reference.",
-    models: "Provider and model picker backed by Hermes /model.",
+    models: "Search, favorite, inspect, and switch models directly in the GUI.",
     tools: "Toolset enablement backed by Hermes tool configuration.",
     skills: "Installed skills, hub browse, and enable/disable controls.",
     plugins: "Installed plugins with enable/disable, rescan, and MCP reload.",
+    doctor: "Guided local setup checks with fix commands.",
     cron: "Scheduled Hermes jobs.",
     keys: "Credential setup status without exposing secret values.",
     system: "Profile, config, and live process status.",
     logs: "Runtime process and browser integration status.",
-  } as Record<Exclude<Pane, "chat">, string>)[activePane];
+  } as Record<Exclude<Pane, "chat" | "fleet">, string>)[activePane as Exclude<Pane, "chat" | "fleet">];
 
   const requestDeleteSession = (sessionId: string) => {
     setPendingDeleteSessionId(sessionId);
@@ -1005,43 +1063,81 @@ function App() {
     setPendingDeleteSessionId(null);
   };
 
-  const renderChatPane = () => {
-    if (showMissionControl) {
-      return (
-        <MissionControlView
-          tree={hermes.subagentTree}
-          status={hermes.status}
-          busy={hermes.busy}
-          liveReasoning={hermes.liveAssistantTurn?.reasoning}
-          liveStreaming={hermes.liveAssistantTurn?.status === "streaming"}
-          onStop={() => void runSafely(() => hermes.interruptSession())}
-          onViewChat={() => setMissionControlDismissed(true)}
-          composer={renderComposer()}
-        />
-      );
-    }
+  const requestFleetStop = (sessionId: string) => {
+    setPendingFleetStopSessionId(sessionId);
+    setFleetStopConfirmVisible(true);
+  };
 
-    return (
+  const confirmFleetStop = () => {
+    const target = pendingFleetStopSessionId;
+    setFleetStopConfirmVisible(false);
+    setPendingFleetStopSessionId(null);
+    if (!target) return;
+    void runSafely(() => hermes.interruptSessionById(target));
+  };
+
+  const cancelFleetStop = () => {
+    setFleetStopConfirmVisible(false);
+    setPendingFleetStopSessionId(null);
+  };
+
+  const openFleetChat = (sessionId: string) => {
+    void runSafely(async () => {
+      await hermes.focusSession(sessionId);
+      setActivePane("chat");
+    });
+  };
+
+  const renderFleetPane = () => (
+    <FleetMissionControlView
+      snapshot={hermes.fleetSnapshot}
+      status={hermes.status}
+      connected={hermes.connected}
+      attentionRequests={hermes.attentionRequests}
+      sessions={hermes.sessions}
+      activeSessionId={hermes.sessionId}
+      onSendPrompt={(targetId, text) => runSafely(() => hermes.sendPromptToSession(targetId, text))}
+      onOpenChat={openFleetChat}
+      onStopSession={requestFleetStop}
+      onRespondAttention={hermes.openAttentionRequest}
+      onOpenAttentionSession={openFleetChat}
+      onOpenSessionMissionControl={
+        hermes.delegationActive || hermes.currentMissionSummary
+          ? () => setActivePane("chat")
+          : undefined
+      }
+    />
+  );
+
+  const renderChatPane = () => (
     <View style={styles.chatPane}>
       <View style={styles.chatMain}>
         <ChatTranscript
           scrollRef={scrollRef}
           scrollKey={hermes.sessionId ?? hermes.activeDbSessionId}
           messages={hermes.messages}
-          emptyState={<DefaultEmptyTranscript />}
+          emptyState={<DefaultEmptyTranscript connected={hermes.connected} />}
         />
 
         {renderComposer()}
       </View>
 
       <View style={styles.activitySidebar}>
-        {renderActivityFeed("compact")}
+        <ActivitySidebar
+          tools={hermes.tools}
+          subagentTree={hermes.subagentTree}
+          subagents={hermes.subagents}
+          fleetSnapshot={hermes.fleetSnapshot}
+          delegationActive={hermes.delegationActive}
+          leadThought={hermes.liveAssistantTurn?.reasoning}
+          leadStreaming={hermes.liveAssistantTurn?.status === "streaming" || composerBusy}
+          onOpenSession={(sessionId) => openSession(sessionId)}
+        />
       </View>
     </View>
-    );
-  };
+  );
 
-  const renderActivityFeed = (mode: "full" | "compact" = "full") => {
+  const renderActivityFeed = (mode: "full" | "compact" = "full", showRunningAgents = false) => {
     const compact = mode === "compact";
     const body = (
       <>
@@ -1055,6 +1151,16 @@ function App() {
         ) : (
           hermes.tools.map((tool) => <ToolActivityCard key={tool.id} tool={tool} compact={compact} />)
         )}
+
+        {showRunningAgents || hermes.delegationActive || hermes.subagents.length > 0 ? (
+          <RunningAgentsPanel
+            tree={hermes.subagentTree}
+            subagents={hermes.subagents}
+            leadThought={hermes.liveAssistantTurn?.reasoning}
+            leadStreaming={hermes.liveAssistantTurn?.status === "streaming" || composerBusy}
+            compact={compact}
+          />
+        ) : null}
       </>
     );
 
@@ -1075,7 +1181,7 @@ function App() {
 
   const renderActivityPane = () => (
     <ScrollView style={styles.fullPane} contentContainerStyle={styles.fullPaneContent}>
-      {renderActivityFeed("full")}
+      {renderActivityFeed("full", hermes.delegationActive || hermes.subagents.length > 0)}
     </ScrollView>
   );
 
@@ -1092,6 +1198,7 @@ function App() {
       connected={hermes.connected}
       sessionSwitchDisabled={sessionSwitchDisabled}
       canSwitchToSession={hermes.canSwitchToSession}
+      liveResponseAt={hermes.liveResponseAt}
       viewMode={settings.sessionsViewMode}
       onViewModeChange={settings.setSessionsViewMode}
       onRefresh={() => void refreshSessionsList()}
@@ -1166,6 +1273,7 @@ function App() {
             toolsets={toolsets}
             onRefresh={() => void loadAuxiliaryData("tools")}
             onToggleToolset={(toolset) => void toggleToolset(toolset)}
+            onApplyToolPreset={(label, names) => void applyToolPreset(label, names)}
           />
         );
       case "skills":
@@ -1199,6 +1307,22 @@ function App() {
             onRescan={() => void rescanPlugins()}
             onReloadMcp={() => void reloadMcp()}
             onTogglePlugin={(plugin) => void togglePlugin(plugin)}
+          />
+        );
+      case "doctor":
+        return (
+          <DoctorPane
+            connected={hermes.connected}
+            loading={auxLoading}
+            message={auxMessage}
+            doctorStatus={doctorStatus}
+            onRefresh={() => void loadAuxiliaryData("doctor")}
+            onRunCommand={async (command) => {
+              setAuxMessage("Running " + command + "…");
+              const result = await hermes.request("terminal.run", { command });
+              setAuxMessage(command + " complete");
+              return result;
+            }}
           />
         );
       case "cron":
@@ -1237,6 +1361,8 @@ function App() {
             onRefresh={() => void loadAuxiliaryData(activePane)}
           />
         );
+      case "fleet":
+        return renderFleetPane();
       case "chat":
       default:
         return renderChatPane();
@@ -1256,10 +1382,11 @@ function App() {
         ? "You have a pending prompt or approval. Starting a new chat will cancel it, stop the current turn, and open a fresh session."
         : "Hermes is still working on a reply. Starting a new chat will stop the current turn and open a fresh session.";
   const switchConfirmLabel = pendingSwitch?.type === "session" ? "Open chat" : "New chat";
+  const saildashMode = themeName === "saildash-dark" ? "dark" : themeName === "saildash-light" ? "light" : null;
 
   return (
     <SafeAreaView style={styles.root}>
-      <StatusBar style="light" />
+      <StatusBar style={saildashMode === "light" ? "dark" : "light"} />
       <BlockingOverlays
         overlay={hermes.overlay}
         onApprovalChoice={hermes.answerApproval}
@@ -1294,6 +1421,16 @@ function App() {
         onCancel={cancelDeleteSession}
       />
 
+      <ConfirmModal
+        visible={fleetStopConfirmVisible}
+        title="Stop this agent?"
+        message={`Stop session ${pendingFleetStopSessionId?.slice(0, 8) ?? ""}? Other fleet agents will keep running.`}
+        confirmLabel="Stop"
+        cancelLabel="Cancel"
+        onConfirm={confirmFleetStop}
+        onCancel={cancelFleetStop}
+      />
+
       <Animated.View style={[styles.mainMenu, { transform: [{ translateX: drawerTranslate }] }]}>
         <MainMenu
           activePane={activePane}
@@ -1313,6 +1450,8 @@ function App() {
               ? backgroundRunningRuntime?.activity
               : activeRuntime?.activity
           }
+          fleetSessionCount={fleetActiveCount}
+          attentionCount={hermes.attentionRequests.length}
           newChatDisabled={newChatDisabled}
           newChatSubtitle={newChatSubtitle}
           sessionsDisabled={sessionsMenuDisabled}
@@ -1341,20 +1480,40 @@ function App() {
             </View>
           </View>
           <View style={styles.headerActions}>
-            {(activeRuntime?.running || hermes.backgroundRunningSessionId) ? (
-              <View style={styles.headerRunningPill}>
-                <SessionStatusBadge
-                  runtime={
-                    hermes.backgroundRunningSessionId
-                      ? backgroundRunningRuntime
-                      : activeRuntime
-                  }
-                  compact
-                />
-                <Text selectable style={styles.headerRunningText} numberOfLines={1}>
-                  {visibleRunningIsActive ? "Running here" : `Running: ${visibleRunningLabel}`}
+            <SailDashModeSwitcher compact />
+            {hermes.attentionRequests.length > 0 ? (
+              <Pressable
+                style={[
+                  styles.secondaryButton,
+                  { borderColor: colors.warning, backgroundColor: colors.systemSurface },
+                ]}
+                onPress={() => {
+                  setActivePane("chat");
+                  setDrawerOpen(false);
+                  hermes.openAttentionRequest(hermes.attentionRequests[0].id);
+                }}
+                accessibilityRole="button"
+                accessibilityLabel={String(hermes.attentionRequests.length) + " attention " + (hermes.attentionRequests.length === 1 ? "request" : "requests")}
+              >
+                <Text style={[styles.secondaryText, { color: colors.warning }]}>
+                  Needs attention · {hermes.attentionRequests.length}
                 </Text>
-              </View>
+              </Pressable>
+            ) : null}
+            {visibleRunningSessionId && visibleRunningRuntime ? (
+              <RunningSessionPill
+                sessionLabel={visibleRunningLabel}
+                sessionId={visibleRunningSessionId}
+                runtime={visibleRunningRuntime}
+                active={visibleRunningIsActive}
+                onPress={() => {
+                  if (visibleRunningIsActive) {
+                    setActivePane("chat");
+                    return;
+                  }
+                  openSession(visibleRunningSessionId);
+                }}
+              />
             ) : null}
             <Pressable
               style={[styles.secondaryButton, newChatDisabled && styles.sendDisabled]}
@@ -1394,29 +1553,23 @@ function App() {
           </View>
         </View>
 
-        {visibleRunningSessionId ? (
-          <RunningSessionBanner
-            sessionLabel={visibleRunningLabel}
-            sessionId={visibleRunningSessionId}
-            runtime={visibleRunningRuntime}
-            active={visibleRunningIsActive}
-            onOpen={() => {
-              if (visibleRunningIsActive) {
-                setActivePane("chat");
-                return;
-              }
-              openSession(visibleRunningSessionId);
-            }}
+        {activePane !== "fleet" ? (
+          <AttentionInbox
+            requests={hermes.attentionRequests}
+            sessions={hermes.sessions}
+            activeSessionId={hermes.sessionId}
+            onRespond={hermes.openAttentionRequest}
+            onOpenSession={(sessionId) => openSession(sessionId)}
           />
         ) : null}
 
-        {activePane === "chat" && hermes.delegationActive && missionControlDismissed ? (
+        {activePane === "chat" && hermes.runningSessionIds.length > 1 ? (
           <Pressable
             style={styles.missionControlBanner}
-            onPress={() => setMissionControlDismissed(false)}
+            onPress={() => selectPane("fleet")}
           >
             <Text style={styles.missionControlBannerText}>
-              Delegation in progress · Open Mission Control
+              {hermes.runningSessionIds.length} agents running · Open Fleet Mission Control
             </Text>
           </Pressable>
         ) : null}

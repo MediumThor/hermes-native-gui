@@ -1,5 +1,5 @@
 import { useMemo } from "react";
-import { X } from "lucide-react-native";
+import { Send, X } from "lucide-react-native";
 import { Pressable, StyleSheet, Text, View } from "react-native";
 import { useDashboardTheme } from "../themes/DashboardThemeProvider";
 import type { NativeThemeColors } from "../themes/types";
@@ -7,16 +7,32 @@ import type { NativeThemeColors } from "../themes/types";
 type Props = {
   items: string[];
   onRemove?: (index: number) => void;
+  onSendNow?: () => void;
+  sendingNow?: boolean;
 };
 
-export function PromptQueueStrip({ items, onRemove }: Props) {
+export function PromptQueueStrip({ items, onRemove, onSendNow, sendingNow = false }: Props) {
   const { colors } = useDashboardTheme();
   const styles = useMemo(() => createStyles(colors), [colors]);
   if (items.length === 0) return null;
 
   return (
     <View style={styles.wrap}>
-      <Text style={styles.label}>Queued follow-ups</Text>
+      <View style={styles.headerRow}>
+        <Text style={styles.label}>Follow-ups waiting</Text>
+        {onSendNow ? (
+          <Pressable
+            style={[styles.sendNowButton, sendingNow && styles.sendNowButtonDisabled]}
+            onPress={onSendNow}
+            disabled={sendingNow}
+            accessibilityRole="button"
+            accessibilityLabel="Send the next queued message now"
+          >
+            <Send color={colors.background} size={12} />
+            <Text style={styles.sendNowText}>Send now</Text>
+          </Pressable>
+        ) : null}
+      </View>
       {items.map((item, index) => (
         <View key={`${index}-${item.slice(0, 24)}`} style={styles.row}>
           <Text selectable style={styles.text} numberOfLines={3}>
@@ -34,7 +50,7 @@ export function PromptQueueStrip({ items, onRemove }: Props) {
           ) : null}
         </View>
       ))}
-      <Text style={styles.hint}>Enter to queue · Press Enter twice (empty) to send the next one now</Text>
+      <Text style={styles.hint}>These will send automatically when Hermes is ready. Use Send now to inject the next one into the current turn.</Text>
     </View>
   );
 }
@@ -55,6 +71,29 @@ function createStyles(colors: NativeThemeColors) {
     fontWeight: "900",
     textTransform: "uppercase",
     letterSpacing: 0.6,
+  },
+  headerRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    gap: 12,
+  },
+  sendNowButton: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 6,
+    borderRadius: 999,
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+    backgroundColor: colors.success,
+  },
+  sendNowButtonDisabled: {
+    opacity: 0.55,
+  },
+  sendNowText: {
+    color: colors.background,
+    fontSize: 11,
+    fontWeight: "800",
   },
   row: {
     flexDirection: "row",

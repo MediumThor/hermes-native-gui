@@ -132,3 +132,15 @@ export function formatSummary(totals: SubagentAggregate): string {
 
   return pieces.join(" · ");
 }
+
+export function flattenSubagentTree(nodes: readonly SubagentNode[]): SubagentProgress[] {
+  const items: SubagentProgress[] = [];
+  const walk = (list: readonly SubagentNode[]) => {
+    for (const node of list) {
+      items.push(node.item);
+      walk(node.children);
+    }
+  };
+  walk(nodes);
+  return items;
+}

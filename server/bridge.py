@@ -11,6 +11,7 @@ import importlib.util
 import os
 import secrets
 import sys
+import time
 from pathlib import Path
 
 SERVICE_NAME = "hermes-native-gui-bridge"
@@ -90,6 +91,149 @@ except Exception as exc:  # pragma: no cover - user-facing startup diagnostic
 def _install_native_gui_methods() -> None:
     """Small GUI-only RPC helpers layered on top of Hermes' gateway methods."""
     methods = getattr(tui_server, "_methods", {})
+
+    def _terminal_run_block_reason(command: str) -> str | None:
+        """Return a short reason when a GUI terminal command is too dangerous."""
+        import re
+        import shlex
+
+        lowered = command.lower()
+        compact = re.sub(r"\s+", "", lowered)
+        home = str(Path.home())
+        home_var = "$" + "{HOME}"
+
+        if re.search(r"(^|[;&|()\s])sudo(\s|$)", lowered):
+            return "sudo is blocked"
+        if ":(){:|:&};:" in compact or re.search(r":\s*\(\s*\)\s*\{\s*:\s*\|\s*:\s*&\s*\}\s*;\s*:", lowered):
+            return "fork bombs are blocked"
+        if re.search(r"(^|[;&|()\s])mkfs(?:\.[\w.-]+)?(\s|$)", lowered):
+            return "mkfs is blocked"
+        if re.search(r"(^|[;&|()\s])(shutdown|reboot|halt)(\s|$)", lowered):
+            return "shutdown/reboot/halt is blocked"
+        if re.search(r"(^|[;&|]\s*)diskutil\s+[^\n;&|]*(erase|partition|secureerase|delete)", lowered):
+            return "destructive diskutil operations are blocked"
+        if re.search(r"\bdd\b[^\n;&|]*\bof=/dev/", lowered):
+            return "dd writes to /dev are blocked"
+        if re.search(r"(?:^|[\s;&|])(?:>|>>)\s*/dev/(?:r?disk)", lowered):
+            return "raw writes to /dev/disk are blocked"
+        if re.search(r"\b(curl|wget)\b[\s\S]{0,400}\|\s*(?:sudo\s+)?(?:/usr/bin/env\s+)?(?:sh|bash|zsh|ksh|fish)\b", lowered):
+            return "curl/wget piped to a shell is blocked"
+
+        obvious_rm = [
+            r"\brm\b[^\n;&|]*(?:\s|^)/(?:\s|$|[;&|*])",
+            r"\brm\b[^\n;&|]*(?:\s|^)(?:~|\$HOME|\$\{HOME\})(?:/|\s|$|[;&|])",
+        ]
+        if home:
+            obvious_rm.append(r"\brm\b[^\n;&|]*(?:\s|^)" + re.escape(home) + r"(?:/|\s|$|[;&|])")
+        if any(re.search(pattern, command) for pattern in obvious_rm):
+            return "destructive rm against /, ~, or $HOME is blocked"
+
+        try:
+            tokens = shlex.split(command, posix=True)
+        except ValueError:
+            tokens = command.split()
+        separators = {";", "&&", "||", "|"}
+        dangerous_targets = {"/", "~", "$HOME", home_var, home}
+        for index, token in enumerate(tokens):
+            if Path(token).name != "rm":
+                continue
+            for target in tokens[index + 1 :]:
+                if target in separators:
+                    break
+                if target.startswith("-"):
+                    continue
+                normalized = target.rstrip("/") or target
+                if target in dangerous_targets or normalized in dangerous_targets:
+                    return "destructive rm against /, ~, or $HOME is blocked"
+                if target.startswith(("~/", "$HOME/", home_var + "/")):
+                    return "destructive rm against /, ~, or $HOME is blocked"
+                if home and (target == home or target.startswith(f"{home}/")):
+                    return "destructive rm against /, ~, or $HOME is blocked"
+                if target.startswith(("/*", "/.")):
+                    return "destructive rm against / is blocked"
+        return None
+
+    if "terminal.run" not in methods:
+
+        @tui_server.method("terminal.run")
+        def _(rid, params: dict) -> dict:
+            import subprocess
+
+            if not isinstance(params, dict):
+                params = {}
+            command = str(params.get("command") or "").strip()
+            if not command:
+                return tui_server._err(rid, 4004, "command required")
+
+            blocked_reason = _terminal_run_block_reason(command)
+            if blocked_reason:
+                return tui_server._err(rid, 4005, f"blocked command: {blocked_reason}")
+
+            cwd_value = params.get("cwd")
+            try:
+                cwd_path = Path(str(cwd_value)).expanduser().resolve() if cwd_value else Path.cwd().resolve()
+            except Exception as exc:
+                return tui_server._err(rid, 4006, f"invalid cwd: {exc}")
+            if not cwd_path.exists() or not cwd_path.is_dir():
+                return tui_server._err(rid, 4006, f"invalid cwd: {cwd_path}")
+
+            try:
+                timeout_seconds = float(params.get("timeout", 60) or 60)
+            except (TypeError, ValueError):
+                return tui_server._err(rid, 4007, "invalid timeout")
+            if timeout_seconds <= 0:
+                return tui_server._err(rid, 4007, "invalid timeout")
+            timeout_seconds = min(timeout_seconds, 120.0)
+
+            started = time.monotonic()
+            timed_out = False
+            exit_code: int | None = None
+            output = ""
+            try:
+                completed = subprocess.run(
+                    command,
+                    shell=True,
+                    executable=os.environ.get("SHELL") or "/bin/zsh",
+                    cwd=str(cwd_path),
+                    env=os.environ.copy(),
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout_seconds,
+                )
+                exit_code = completed.returncode
+                output = (completed.stdout or "") + (completed.stderr or "")
+            except subprocess.TimeoutExpired as exc:
+                timed_out = True
+                exit_code = -1
+                stdout = exc.stdout or ""
+                stderr = exc.stderr or ""
+                if isinstance(stdout, bytes):
+                    stdout = stdout.decode(errors="replace")
+                if isinstance(stderr, bytes):
+                    stderr = stderr.decode(errors="replace")
+                output = f"{stdout}{stderr}\nCommand timed out after {timeout_seconds:g}s."
+            except Exception as exc:
+                return tui_server._err(rid, 5003, str(exc))
+
+            duration_seconds = time.monotonic() - started
+            output = output.strip() or "(no output)"
+            if len(output) > 20_000:
+                total = len(output)
+                head = output[:9_800]
+                tail = output[-9_800:]
+                output = f"{head}\n\n… output truncated ({total} chars total) …\n\n{tail}"
+
+            return tui_server._ok(
+                rid,
+                {
+                    "command": command,
+                    "cwd": str(cwd_path),
+                    "exit_code": exit_code,
+                    "duration_seconds": round(duration_seconds, 3),
+                    "output": output,
+                    "timed_out": timed_out,
+                },
+            )
 
     if "image.clear" not in methods:
 
@@ -180,6 +324,257 @@ def _install_native_gui_methods() -> None:
                 return tui_server._ok(rid, result)
             except Exception as exc:
                 return tui_server._err(rid, 5029, str(exc))
+
+    if "doctor.status" not in methods:
+
+        @tui_server.method("doctor.status")
+        def _(rid, params: dict) -> dict:
+            def check(
+                check_id: str,
+                label: str,
+                ok: bool,
+                detail: str,
+                command: str | None = None,
+                warning: bool = False,
+            ) -> dict[str, str]:
+                status = "ok" if ok else "warning" if warning else "error"
+                row = {
+                    "id": check_id,
+                    "label": label,
+                    "status": status,
+                    "detail": detail,
+                }
+                if command:
+                    row["command"] = command
+                return row
+
+            def parse_node_version(raw: str) -> tuple[int, int, int] | None:
+                raw = raw.strip().lstrip("v")
+                pieces = raw.split(".")
+                if len(pieces) < 2:
+                    return None
+                try:
+                    major = int(pieces[0])
+                    minor = int(pieces[1])
+                    patch = int(pieces[2]) if len(pieces) > 2 else 0
+                    return major, minor, patch
+                except ValueError:
+                    return None
+
+            def node_ok(version: tuple[int, int, int] | None) -> bool:
+                if version is None:
+                    return False
+                major, minor, patch = version
+                return (major == 20 and (minor, patch) >= (19, 0)) or (major > 20 and (major, minor, patch) >= (22, 12, 0))
+
+            checks: list[dict[str, str]] = []
+
+            hermes_root = HERMES_ROOT or Path(os.environ.get("HERMES_AGENT_ROOT", "~/.hermes/hermes-agent")).expanduser()
+            hermes_installed = importlib.util.find_spec("tui_gateway.ws") is not None or _has_tui_gateway(hermes_root)
+            checks.append(check(
+                "hermes_installed",
+                "Hermes installed",
+                hermes_installed,
+                f"Hermes gateway package found at {hermes_root if hermes_root else 'import path'}." if hermes_installed else "Could not locate Hermes Agent's tui_gateway package.",
+                "hermes setup",
+            ))
+
+            try:
+                from hermes_cli.config import load_config
+
+                config = load_config()
+                checks.append(check(
+                    "config_valid",
+                    "Config valid",
+                    isinstance(config, dict),
+                    "config.yaml loaded successfully." if isinstance(config, dict) else "Config loaded but did not return a mapping.",
+                    "hermes config show",
+                    warning=not isinstance(config, dict),
+                ))
+            except Exception as exc:
+                checks.append(check(
+                    "config_valid",
+                    "Config valid",
+                    False,
+                    f"Could not load Hermes config: {exc}",
+                    "hermes setup",
+                ))
+
+            try:
+                from hermes_cli.main import _has_any_provider_configured
+
+                provider_configured = bool(_has_any_provider_configured())
+                checks.append(check(
+                    "provider_configured",
+                    "Provider configured",
+                    provider_configured,
+                    "At least one model provider credential is configured." if provider_configured else "No configured provider credentials were detected.",
+                    "hermes setup",
+                ))
+                checks.append(check(
+                    "credentials_present",
+                    "Credentials present",
+                    provider_configured,
+                    "Provider credentials are available via Hermes config/.env." if provider_configured else "Add provider credentials through setup or ~/.hermes/.env.",
+                    "hermes setup",
+                ))
+            except Exception as exc:
+                checks.append(check(
+                    "provider_configured",
+                    "Provider configured",
+                    False,
+                    f"Could not inspect provider credentials: {exc}",
+                    "hermes setup",
+                ))
+
+            import subprocess
+
+            node_candidates = [
+                os.environ.get("HERMES_NATIVE_GUI_NODE"),
+                "/opt/homebrew/opt/node@22/bin/node",
+                "node",
+            ]
+            best_node: tuple[str, str, tuple[int, int, int] | None] | None = None
+            for candidate in [value for value in node_candidates if value]:
+                try:
+                    completed = subprocess.run([candidate, "--version"], capture_output=True, text=True, timeout=3)
+                    if completed.returncode != 0:
+                        continue
+                    raw_version = completed.stdout.strip()
+                    parsed = parse_node_version(raw_version)
+                    if best_node is None or node_ok(parsed):
+                        best_node = (candidate, raw_version, parsed)
+                    if node_ok(parsed):
+                        break
+                except Exception:
+                    continue
+            node_valid = node_ok(best_node[2] if best_node else None)
+            checks.append(check(
+                "node_version",
+                "Node version ok",
+                node_valid,
+                f"Found {best_node[1]} at {best_node[0]}. Expo needs Node 20.19+ or 22.12+." if best_node else "Node was not found on the bridge PATH.",
+                "export PATH=\"/opt/homebrew/opt/node@22/bin:$PATH\" && npm run build:web",
+            ))
+
+            python_missing: list[str] = []
+            for module_name in ["fastapi", "uvicorn", "tui_gateway.ws"]:
+                try:
+                    importlib.import_module(module_name)
+                except Exception:
+                    python_missing.append(module_name)
+            checks.append(check(
+                "python_deps",
+                "Python deps ok",
+                not python_missing,
+                "Bridge Python dependencies imported successfully." if not python_missing else f"Missing Python module(s): {', '.join(python_missing)}",
+                f"{hermes_root}/.venv/bin/python server/bridge.py" if hermes_root else "python server/bridge.py",
+            ))
+
+
+            try:
+                completed = subprocess.run(
+                    ["hermes", "computer-use", "status"],
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                )
+                computer_use_output = ((completed.stdout or "") + (completed.stderr or "")).strip()
+                computer_use_ok = completed.returncode == 0 and "installed" in computer_use_output.lower()
+                checks.append(check(
+                    "computer_use_cua_driver",
+                    "Computer Use / CuaDriver",
+                    computer_use_ok,
+                    computer_use_output or "Computer Use status did not return output.",
+                    "hermes computer-use install --upgrade",
+                    warning=completed.returncode == 0 and not computer_use_ok,
+                ))
+            except Exception as exc:
+                checks.append(check(
+                    "computer_use_cua_driver",
+                    "Computer Use / CuaDriver",
+                    False,
+                    f"Could not inspect Computer Use setup: {exc}",
+                    "hermes computer-use install --upgrade",
+                    warning=True,
+                ))
+
+            checks.append(check(
+                "bridge_reachable",
+                "Bridge reachable",
+                True,
+                f"WebSocket RPC is connected to {SERVICE_NAME} on port {BRIDGE_PORT}.",
+                None,
+            ))
+
+            return tui_server._ok(rid, {"checks": checks, "generated_at": time.time()})
+
+    @tui_server.method("session.list")
+    def session_list_by_last_response(rid, params: dict) -> dict:
+        """Order sessions by most recent assistant reply (native GUI)."""
+        db = tui_server._get_db()
+        if db is None:
+            return tui_server._db_unavailable_error(rid, code=5006)
+        try:
+            deny = frozenset({"tool"})
+            limit = int(params.get("limit", 200) or 200)
+            fetch_limit = max(limit * 2, 200)
+            rows = [
+                s
+                for s in db.list_sessions_rich(source=None, limit=fetch_limit)
+                if (s.get("source") or "").strip().lower() not in deny
+            ]
+            ids = [str(s["id"]) for s in rows if s.get("id")]
+            last_response: dict[str, float] = {}
+            if ids:
+                placeholders = ",".join("?" for _ in ids)
+                with db._lock:
+                    cursor = db._conn.execute(
+                        f"""
+                        SELECT session_id, MAX(timestamp) AS last_response_at
+                        FROM messages
+                        WHERE role = 'assistant' AND session_id IN ({placeholders})
+                        GROUP BY session_id
+                        """,
+                        ids,
+                    )
+                    for row in cursor.fetchall():
+                        last_response[str(row["session_id"])] = float(row["last_response_at"] or 0)
+
+            for row in rows:
+                sid = str(row["id"])
+                row["_last_response_at"] = (
+                    last_response.get(sid)
+                    or row.get("last_active")
+                    or row.get("started_at")
+                    or 0
+                )
+
+            rows.sort(
+                key=lambda row: float(row.get("_last_response_at") or 0),
+                reverse=True,
+            )
+            rows = rows[:limit]
+
+            return tui_server._ok(
+                rid,
+                {
+                    "sessions": [
+                        {
+                            "id": s["id"],
+                            "title": s.get("title") or "",
+                            "preview": s.get("preview") or "",
+                            "started_at": s.get("started_at") or 0,
+                            "last_response_at": s.get("_last_response_at") or 0,
+                            "message_count": s.get("message_count") or 0,
+                            "source": s.get("source") or "",
+                        }
+                        for s in rows
+                    ]
+                },
+            )
+        except Exception as exc:
+            return tui_server._err(rid, 5006, str(exc))
 
 
 def _install_transport_rebind_patch() -> None:

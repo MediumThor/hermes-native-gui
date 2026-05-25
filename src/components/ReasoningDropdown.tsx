@@ -9,9 +9,11 @@ type Props = {
   title?: string;
   streaming?: boolean;
   reasoning?: string;
+  responseText?: string;
   placeholder?: string;
   defaultOpen?: boolean;
   autoOpenOnReasoning?: boolean;
+  autoCollapseOnResponse?: boolean;
 };
 
 function createStyles(colors: NativeThemeColors) {
@@ -75,20 +77,29 @@ export function ReasoningDropdown({
   title = "Assistant",
   streaming = false,
   reasoning,
-  placeholder = "Reasoning will appear here as the model thinks…",
+  responseText,
+  placeholder = "Hermes will show its thinking here while it works…",
   defaultOpen = false,
   autoOpenOnReasoning = true,
+  autoCollapseOnResponse = true,
 }: Props) {
   const { colors } = useDashboardTheme();
   const styles = useMemo(() => createStyles(colors), [colors]);
   const [open, setOpen] = useState(defaultOpen);
   const hasReasoning = Boolean(reasoning?.trim());
+  const hasResponse = Boolean(responseText?.trim());
 
   useEffect(() => {
-    if (autoOpenOnReasoning && streaming) {
+    if (autoOpenOnReasoning && streaming && !hasResponse) {
       setOpen(true);
     }
-  }, [autoOpenOnReasoning, streaming]);
+  }, [autoOpenOnReasoning, hasResponse, streaming]);
+
+  useEffect(() => {
+    if (autoCollapseOnResponse && hasResponse) {
+      setOpen(false);
+    }
+  }, [autoCollapseOnResponse, hasResponse]);
 
   if (!streaming && !hasReasoning) return null;
 
@@ -130,7 +141,7 @@ export function ReasoningDropdown({
         </View>
       ) : null}
 
-      {streaming ? (
+      {streaming && !hasResponse ? (
         <View style={styles.dotsRow}>
           <StreamingDots active color={colors.success} />
         </View>

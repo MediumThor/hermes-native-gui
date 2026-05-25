@@ -1,11 +1,13 @@
 import type { LucideIcon } from "lucide-react-native";
 import {
   Activity,
+  AlertTriangle,
   BookOpen,
   CalendarClock,
   Cpu,
   History,
   KeyRound,
+  LayoutGrid,
   MessageSquare,
   Package,
   Plug,
@@ -13,6 +15,7 @@ import {
   Settings,
   ShieldCheck,
   SlidersHorizontal,
+  Stethoscope,
   TerminalSquare,
   X,
 } from "lucide-react-native";
@@ -28,7 +31,7 @@ import { ThemeSwitcher } from "./ThemeSwitcher";
 
 export const MAIN_MENU_WIDTH = 304;
 
-export type MainMenuPane = "chat" | "sessions" | "activity" | "settings" | "commands" | "models" | "tools" | "skills" | "plugins" | "cron" | "keys" | "system" | "logs";
+export type MainMenuPane = "chat" | "fleet" | "sessions" | "activity" | "settings" | "commands" | "models" | "tools" | "skills" | "plugins" | "doctor" | "cron" | "keys" | "system" | "logs";
 
 type Props = {
   activePane: MainMenuPane;
@@ -38,6 +41,8 @@ type Props = {
   toolCount: number;
   runningSessionLabel?: string | null;
   runningSessionActivity?: string;
+  fleetSessionCount?: number;
+  attentionCount?: number;
   newChatDisabled: boolean;
   newChatSubtitle: string;
   sessionsDisabled: boolean;
@@ -110,6 +115,56 @@ function createStyles(colors: NativeThemeColors) {
       color: colors.midgroundFaint,
       fontSize: 12,
       lineHeight: 17,
+    },
+    attentionCard: {
+      borderWidth: 1,
+      borderColor: colors.warning,
+      backgroundColor: colors.systemSurface,
+      borderRadius: 16,
+      padding: 14,
+      marginBottom: 14,
+      gap: 6,
+    },
+    attentionCardTop: {
+      flexDirection: "row",
+      alignItems: "center",
+      justifyContent: "space-between",
+      gap: 10,
+    },
+    attentionEyebrow: {
+      color: colors.warning,
+      fontSize: 11,
+      fontWeight: "900",
+      letterSpacing: 1.1,
+      textTransform: "uppercase",
+    },
+    attentionTitle: {
+      color: colors.midground,
+      fontSize: 13,
+      fontWeight: "900",
+    },
+    attentionIcon: {
+      width: 30,
+      height: 30,
+      borderRadius: 999,
+      borderWidth: 1,
+      borderColor: colors.warning,
+      alignItems: "center",
+      justifyContent: "center",
+    },
+    attentionBadge: {
+      minWidth: 26,
+      height: 26,
+      borderRadius: 999,
+      paddingHorizontal: 8,
+      backgroundColor: colors.warning,
+      alignItems: "center",
+      justifyContent: "center",
+    },
+    attentionBadgeText: {
+      color: colors.background,
+      fontSize: 12,
+      fontWeight: "900",
     },
     menuScroll: { flex: 1 },
     menuSection: { gap: 14, paddingBottom: 8 },
@@ -225,6 +280,8 @@ export function MainMenu({
   toolCount,
   runningSessionLabel,
   runningSessionActivity,
+  fleetSessionCount = 0,
+  attentionCount = 0,
   newChatDisabled,
   newChatSubtitle,
   sessionsDisabled,
@@ -249,6 +306,7 @@ export function MainMenu({
     subtitle: string,
     Icon: LucideIcon,
     disabled = false,
+    badgeCount = 0,
   ) => (
     <Pressable
       key={pane}
@@ -261,6 +319,11 @@ export function MainMenu({
         <Text style={styles.menuItemTitle}>{label}</Text>
         <Text style={styles.menuItemSubtitle}>{subtitle}</Text>
       </View>
+      {badgeCount > 0 ? (
+        <View style={styles.attentionBadge}>
+          <Text style={styles.attentionBadgeText}>{badgeCount}</Text>
+        </View>
+      ) : null}
     </Pressable>
   );
 
@@ -283,7 +346,13 @@ export function MainMenu({
     {
       title: "Chat",
       items: [
-        renderPaneItem("chat", "Chat", `${messageCount} messages`, MessageSquare),
+        renderPaneItem("chat", "Chat", `${messageCount} messages`, MessageSquare, false, attentionCount),
+        renderPaneItem(
+          "fleet",
+          "Fleet Mission Control",
+          `${fleetSessionCount} active ${fleetSessionCount === 1 ? "session" : "sessions"}`,
+          LayoutGrid,
+        ),
         renderActionItem(),
         renderPaneItem("sessions", "Sessions", `${sessionCount} recent chats`, History, sessionsDisabled),
         renderPaneItem("activity", "Activity", `${toolCount} tool calls`, Activity),
@@ -296,6 +365,7 @@ export function MainMenu({
         renderPaneItem("commands", "Commands", "Slash command reference", BookOpen),
         renderPaneItem("models", "Models", "Providers and model picker", Cpu),
         renderPaneItem("tools", "Tools", "Toolset enablement", SlidersHorizontal),
+        renderPaneItem("doctor", "Doctor", "Setup checks and fixes", Stethoscope),
         renderPaneItem("keys", "Keys", "Credential status", KeyRound),
       ],
     },
@@ -327,6 +397,27 @@ export function MainMenu({
           <X color={colors.midground} size={20} />
         </Pressable>
       </View>
+
+      {attentionCount > 0 ? (
+        <Pressable
+          style={styles.attentionCard}
+          onPress={() => onSelectPane("chat")}
+          accessibilityRole="button"
+          accessibilityLabel={String(attentionCount) + " " + (attentionCount === 1 ? "item" : "items") + " need attention"}
+        >
+          <View style={styles.attentionCardTop}>
+            <View>
+              <Text selectable style={styles.attentionEyebrow}>Needs attention</Text>
+              <Text selectable style={styles.attentionTitle}>
+                {attentionCount} blocked {attentionCount === 1 ? "item" : "items"}
+              </Text>
+            </View>
+            <View style={styles.attentionIcon}>
+              <AlertTriangle color={colors.warning} size={16} />
+            </View>
+          </View>
+        </Pressable>
+      ) : null}
 
       {runningSessionLabel ? (
         <View style={styles.runningCard}>

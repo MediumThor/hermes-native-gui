@@ -41,6 +41,8 @@ export interface DashboardTheme {
   typography: ThemeTypography;
   layout: ThemeLayout;
   colorOverrides?: ThemeColorOverrides;
+  /** Fully specified native tokens for themes that need platform-precise surfaces */
+  nativeColors?: NativeThemeColors;
   /** Use the original Hermes React GUI palette instead of derived blends */
   canonical?: boolean;
   /** Sharper borders and text steps — less washed-out blending */

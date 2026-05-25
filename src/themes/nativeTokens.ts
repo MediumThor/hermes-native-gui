@@ -47,6 +47,10 @@ function textOn(accentHex: string, darkBackground: boolean): string {
 }
 
 export function themeToNativeColors(theme: DashboardTheme): NativeThemeColors {
+  if (theme.nativeColors) {
+    return theme.nativeColors;
+  }
+
   if (theme.canonical) {
     return hermesCanonicalColors(parseRadius(theme.layout.radius || "0.5rem"));
   }

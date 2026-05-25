@@ -26,13 +26,23 @@ import {
   type SessionSnapshot,
 } from "./bridgeSecurity";
 import {
+  appendSystemTranscriptMessage,
+  mergeLiveActivityMessages,
+} from "./liveActivityTranscript";
+import {
+  appendSlashCommandTurn,
+  coalesceAssistantReasoningTurns,
+  enrichTranscriptWithReasoning,
+  finalizeTranscriptHistory,
   loadCachedTranscript,
   mergeTranscriptMessages,
   pickRicherTranscript,
+  reconcileTranscriptHistory,
   saveCachedTranscript,
+  sortTranscriptChronologically,
 } from "./chatTranscriptStorage";
 import { summarizeUnknownRequest } from "./requestPayloadSanitizer";
-import { isSessionBusyError } from "./promptDelivery";
+import { isComposerBusy, isSessionBusyError } from "./promptDelivery";
 import {
   applySubagentEvent,
   delegationIsActive,
@@ -40,6 +50,46 @@ import {
 import { buildSubagentTree } from "./subagentTree";
 import type { SubagentEventPayload, SubagentProgress } from "./subagentTypes";
 import { EMPTY_OVERLAY } from "./types";
+import {
+  attentionRequestFromEvent,
+  removeAttentionRequest,
+  upsertAttentionRequest,
+  type AttentionRequest,
+} from "./attentionInbox";
+import { createMissionSummary, joinSubagentSummaries, type MissionSummary } from "./missionTimeline";
+import { loadMissionSummaries, saveMissionSummaries, upsertMissionSummary } from "./missionSummaryStorage";
+import {
+  actionFromGatewayEvent,
+  actionSummary,
+  describeQueuedPrompt,
+  isRenderableActivity,
+  serializeAgentAction,
+  type AgentAction,
+} from "./agentActivity";
+import { extractInlineDiff } from "./diffUtils";
+import {
+  aliasPurposeTitles,
+  purposeTitleFromPrompt,
+  resolveSessionPurposeTitle,
+} from "./sessionPurposeTitles";
+import {
+  normalizeGatewaySessionTitle,
+  shouldSyncSessionTitle,
+} from "./sessionTitleSync";
+import {
+  applySubagentEventForSession,
+  stashSubagentsForSession,
+  subagentsForAliases,
+  type SubagentsBySessionId,
+} from "./sessionSubagents";
+import {
+  buildFleetSnapshot,
+  fleetTargetGatewayId,
+  FLEET_NEW_AGENT_TARGET,
+  resolveRuntimeForAliases,
+  resolveLiveGatewayForTarget,
+  type FleetSnapshot,
+} from "./fleetMission";
 
 type UseHermesRpcOptions = {
   autoResumeOnConnect?: boolean;
@@ -89,6 +139,26 @@ function resolveGatewaySessionId(
   return gatewayId ?? target;
 }
 
+function runtimeAliasesForSession(
+  targetId: string,
+  sessionKeyByGatewayId: Record<string, string>,
+  gatewayIdBySessionKey: Record<string, string>,
+): Set<string> {
+  const aliases = new Set<string>([targetId]);
+  const addAliasPair = (id: string) => {
+    const dbKey = sessionKeyByGatewayId[id];
+    if (dbKey) aliases.add(dbKey);
+    const gatewayId = gatewayIdBySessionKey[id];
+    if (gatewayId) aliases.add(gatewayId);
+  };
+
+  addAliasPair(targetId);
+  for (const alias of [...aliases]) {
+    addAliasPair(alias);
+  }
+  return aliases;
+}
+
 function parseSessionStatus(output: string) {
   const sessionKeyMatch = output.match(/^Session ID: (.+)$/m);
   const runningMatch = output.match(/^Agent Running: (Yes|No)$/m);
@@ -98,18 +168,75 @@ function parseSessionStatus(output: string) {
   };
 }
 
-function mapHistoryMessages(restored: unknown[]): ChatMessage[] {
+export function mapHistoryMessages(restored: unknown[]): ChatMessage[] {
+  const baseTime = Date.now() - restored.length * 1000;
   return restored.map((entry, index) => {
     const m = entry as Record<string, unknown>;
     const role = m.role;
+    const reasoning = typeof m.reasoning === "string" && m.reasoning.trim() ? m.reasoning : undefined;
+    const createdAt = Number(m.timestamp ?? m.created_at ?? m.createdAt ?? 0);
     return {
-      id: `restored-${index}-${Date.now()}`,
+      id: String(m.id ?? `restored-${index}`),
       role: role === "assistant" || role === "user" ? role : "system",
       text: String(m.text ?? m.content ?? m.context ?? ""),
+      reasoning,
       status: "complete" as const,
-      createdAt: Date.now() + index,
+      createdAt: createdAt > 0 ? createdAt : baseTime + index * 1000,
     };
   });
+}
+
+export function appendLocalUserTurn(
+  messages: ChatMessage[],
+  text: string,
+  options: { id?: string; now?: number } = {},
+): { message: ChatMessage; messages: ChatMessage[] } {
+  const now = options.now ?? Date.now();
+  const message: ChatMessage = {
+    id: options.id ?? `user-${now}`,
+    role: "user",
+    text,
+    createdAt: now,
+  };
+  return { message, messages: [...messages, message] };
+}
+
+function transcriptHasPendingUserTurn(messages: ChatMessage[], text: string): boolean {
+  const userIndex = [...messages]
+    .map((message, index) => ({ message, index }))
+    .reverse()
+    .find(({ message }) => message.role === "user" && message.text === text)?.index;
+  if (userIndex == null) return false;
+  return !messages.slice(userIndex + 1).some((message) => message.role === "assistant");
+}
+
+function removeTranscriptMessage(messages: ChatMessage[], messageId: string): ChatMessage[] {
+  return messages.filter((message) => message.id !== messageId);
+}
+
+function transcriptTurnLooksComplete(messages: ChatMessage[]): boolean {
+  if (messages.some((message) => message.status === "streaming")) return false;
+  const last = messages[messages.length - 1];
+  return last?.role === "assistant" && last.status === "complete" && Boolean(last.text?.trim());
+}
+
+function snapshotIndicatesActiveWork(
+  snapshot: SessionSnapshot,
+  messages: ChatMessage[],
+): boolean {
+  if (!snapshot.running) return false;
+  if (snapshot.active_tools.length > 0) return true;
+  return !transcriptTurnLooksComplete(messages);
+}
+
+function finalizePolledTranscript(messages: ChatMessage[]): ChatMessage[] {
+  return finalizeTranscriptHistory(
+    messages.map((message) =>
+      message.status === "streaming" && message.text?.trim()
+        ? { ...message, status: "complete" as const }
+        : message,
+    ),
+  );
 }
 
 function mapSnapshotTools(snapshot: SessionSnapshot): ToolActivity[] {
@@ -125,6 +252,17 @@ function mapSnapshotTools(snapshot: SessionSnapshot): ToolActivity[] {
 
 function findStreamingAssistantId(messages: ChatMessage[]): string | null {
   return messages.find((message) => message.role === "assistant" && message.status === "streaming")?.id ?? null;
+}
+
+/** Prefer the streaming assistant that still accepts live reasoning (nothing system-related after it). */
+function findActiveReasoningTargetId(messages: ChatMessage[]): string | null {
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index];
+    if (message.role !== "assistant" || message.status !== "streaming") continue;
+    const hasSystemAfter = messages.slice(index + 1).some((entry) => entry.role === "system");
+    if (!hasSystemAfter) return message.id;
+  }
+  return null;
 }
 
 function appendStreamingAssistantBubble(
@@ -153,15 +291,268 @@ function persistSessionTranscript(
   gatewayId: string | null,
   dbKey: string | undefined,
   messages: ChatMessage[],
+  memoryStore?: Record<string, ChatMessage[]>,
+  sessionKeyByGatewayId: Record<string, string> = {},
+  gatewayIdBySessionKey: Record<string, string> = {},
+  options: { includeInProgress?: boolean } = {},
 ) {
-  const stable = messages.filter((message) => message.status !== "streaming");
-  if (!gatewayId || stable.length === 0) return;
-  saveCachedTranscript(gatewayId, stable);
-  if (dbKey) saveCachedTranscript(dbKey, stable);
+  const snapshot = messages
+    .filter((message) => options.includeInProgress || message.status !== "streaming")
+    .map((message) => ({ ...message }));
+  if (!gatewayId || snapshot.length === 0) return;
+
+  const existing = recallSessionTranscript(
+    gatewayId,
+    dbKey,
+    memoryStore ?? {},
+    sessionKeyByGatewayId,
+    gatewayIdBySessionKey,
+  );
+  const toSave = finalizeTranscriptHistory(
+    pickRicherTranscript(
+      enrichTranscriptWithReasoning(snapshot, existing),
+      existing,
+    ),
+  );
+
+  if (memoryStore) {
+    memoryStore[gatewayId] = toSave;
+    if (dbKey) memoryStore[dbKey] = toSave;
+  }
+  saveCachedTranscript(gatewayId, toSave);
+  if (dbKey) saveCachedTranscript(dbKey, toSave);
+}
+
+function stashActiveSessionTranscript(
+  gatewayId: string | null,
+  dbKey: string | undefined,
+  messages: ChatMessage[],
+  memoryStore: Record<string, ChatMessage[]>,
+  sessionKeyByGatewayId: Record<string, string> = {},
+  gatewayIdBySessionKey: Record<string, string> = {},
+) {
+  if (!gatewayId || messages.length === 0) return;
+  const snapshot = messages.map((message) => (
+    message.status === "streaming"
+      ? { ...message, status: "complete" as const }
+      : message
+  ));
+  persistSessionTranscript(
+    gatewayId,
+    dbKey,
+    snapshot,
+    memoryStore,
+    sessionKeyByGatewayId,
+    gatewayIdBySessionKey,
+  );
+}
+
+function recallSessionTranscript(
+  gatewayId: string,
+  dbKey: string | undefined,
+  memoryStore: Record<string, ChatMessage[]>,
+  sessionKeyByGatewayId: Record<string, string> = {},
+  gatewayIdBySessionKey: Record<string, string> = {},
+): ChatMessage[] {
+  const keys = new Set<string>([gatewayId]);
+  if (dbKey) keys.add(dbKey);
+  const mappedDb = sessionKeyByGatewayId[gatewayId];
+  if (mappedDb) keys.add(mappedDb);
+  if (dbKey) {
+    const mappedGateway = gatewayIdBySessionKey[dbKey];
+    if (mappedGateway) keys.add(mappedGateway);
+  }
+
+  let best: ChatMessage[] = [];
+  for (const key of keys) {
+    if (!key) continue;
+    best = pickRicherTranscript(best, memoryStore[key] ?? []);
+    best = pickRicherTranscript(best, loadCachedTranscript(key));
+  }
+  return best;
+}
+
+function resolveStoredSessionKeys(
+  target: string,
+  sessionKeyByGatewayId: Record<string, string>,
+  gatewayIdBySessionKey: Record<string, string>,
+  knownGatewayIds: Set<string>,
+): { gatewayId: string; dbKey?: string } {
+  const gatewayId = resolveGatewaySessionId(
+    target,
+    sessionKeyByGatewayId,
+    gatewayIdBySessionKey,
+    knownGatewayIds,
+  ) ?? target;
+  const dbKey =
+    sessionKeyByGatewayId[gatewayId] ??
+    (gatewayIdBySessionKey[target] ? target : undefined) ??
+    (knownGatewayIds.has(target) ? sessionKeyByGatewayId[target] : undefined);
+  return { gatewayId, dbKey };
+}
+
+function isReasoningOnlyAssistant(message: ChatMessage): boolean {
+  return message.role === "assistant" && !message.text?.trim();
+}
+
+function liveActivityAction(type: string, data: Record<string, unknown>): AgentAction | null {
+  return actionFromGatewayEvent(type, data);
+}
+
+function liveActivityText(type: string, data: Record<string, unknown>): string {
+  const action = liveActivityAction(type, data);
+  return action ? actionSummary(action) : "";
+}
+
+function liveActivityMessageText(type: string, data: Record<string, unknown>): string {
+  const action = liveActivityAction(type, data);
+  return action ? serializeAgentAction(action) : "";
+}
+
+function appendReasoningSnippet(
+  messages: ChatMessage[],
+  snippet: string,
+): { messages: ChatMessage[]; id: string } {
+  if (!snippet) {
+    const existing = findActiveReasoningTargetId(messages) ?? findStreamingAssistantId(messages);
+    return { messages, id: existing ?? "" };
+  }
+
+  const streamingId = findActiveReasoningTargetId(messages);
+  if (streamingId) {
+    return {
+      id: streamingId,
+      messages: messages.map((message) =>
+        message.id === streamingId
+          ? { ...message, reasoning: `${message.reasoning ?? ""}${snippet}` }
+          : message,
+      ),
+    };
+  }
+
+  const lastReasoningOnlyIndex = [...messages]
+    .map((message, index) => ({ message, index }))
+    .reverse()
+    .find(({ message }) => isReasoningOnlyAssistant(message) && message.status === "streaming")?.index;
+
+  if (lastReasoningOnlyIndex !== undefined) {
+    const targetId = messages[lastReasoningOnlyIndex].id;
+    return {
+      id: targetId,
+      messages: messages.map((message, index) =>
+        index === lastReasoningOnlyIndex
+          ? {
+              ...message,
+              reasoning: `${message.reasoning ?? ""}${snippet}`,
+              status: "streaming" as const,
+            }
+          : message,
+      ),
+    };
+  }
+
+  const { messages: withBubble, id } = appendStreamingAssistantBubble(messages);
+  return {
+    id,
+    messages: withBubble.map((message) =>
+      message.id === id
+        ? { ...message, reasoning: `${message.reasoning ?? ""}${snippet}` }
+        : message,
+    ),
+  };
+}
+
+function applyReasoningDeltaToMessages(
+  messages: ChatMessage[],
+  snippet: string,
+): ChatMessage[] {
+  return appendReasoningSnippet(messages, snippet).messages;
+}
+
+function applyMessageCompleteToMessages(
+  messages: ChatMessage[],
+  text: string,
+  reasoning: string,
+  status: ChatMessage["status"],
+): ChatMessage[] {
+  const streamingId = findStreamingAssistantId(messages);
+  if (streamingId) {
+    return messages.map((message) =>
+      message.id === streamingId
+        ? {
+            ...message,
+            text: text || message.text,
+            reasoning: reasoning || message.reasoning,
+            status: status ?? "complete",
+          }
+        : message,
+    );
+  }
+
+  const lastAssistantIndex = [...messages]
+    .map((message, index) => ({ message, index }))
+    .reverse()
+    .find(({ message }) => message.role === "assistant")?.index;
+  if (lastAssistantIndex === undefined) return messages;
+
+  return messages.map((message, index) =>
+    index === lastAssistantIndex
+      ? {
+          ...message,
+          text: text || message.text,
+          reasoning: reasoning || message.reasoning,
+          status: status ?? "complete",
+        }
+      : message,
+  );
 }
 
 function appendInProgressBubble(messages: ChatMessage[]): ChatMessage[] {
   return appendStreamingAssistantBubble(messages, "assistant-resume").messages;
+}
+
+function overlayPatchFromAttention(request: AttentionRequest): Partial<OverlayState> {
+  switch (request.kind) {
+    case "approval":
+      return {
+        approval: {
+          command: request.command ?? request.preview,
+          description: request.description,
+          sessionId: request.sessionId,
+          attentionId: request.id,
+        },
+      };
+    case "clarify":
+      return {
+        clarify: {
+          question: request.description,
+          choices: request.choices ?? null,
+          requestId: request.requestId ?? "",
+          sessionId: request.sessionId,
+          attentionId: request.id,
+        },
+      };
+    case "sudo":
+      return {
+        sudo: {
+          requestId: request.requestId ?? "",
+          sessionId: request.sessionId,
+          attentionId: request.id,
+        },
+      };
+    case "secret":
+      return {
+        secret: {
+          envVar: request.envVar ?? "",
+          prompt: request.prompt ?? request.description,
+          requestId: request.requestId ?? "",
+          sessionId: request.sessionId,
+          attentionId: request.id,
+        },
+      };
+    default:
+      return {};
+  }
 }
 
 export function useHermesRpc(options: UseHermesRpcOptions = {}) {
@@ -174,8 +565,13 @@ export function useHermesRpc(options: UseHermesRpcOptions = {}) {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [tools, setTools] = useState<ToolActivity[]>([]);
   const [subagents, setSubagents] = useState<SubagentProgress[]>([]);
+  const subagentsRef = useRef<SubagentProgress[]>([]);
+  const [subagentsBySessionId, setSubagentsBySessionId] = useState<SubagentsBySessionId>({});
+  const subagentsBySessionIdRef = useRef<SubagentsBySessionId>({});
   const [promptQueue, setPromptQueue] = useState<string[]>([]);
   const [sessions, setSessions] = useState<SessionSummary[]>([]);
+  const sessionsRef = useRef<SessionSummary[]>([]);
+  const [sessionLastResponseAt, setSessionLastResponseAt] = useState<Record<string, number>>({});
   const [sessionRuntime, setSessionRuntime] = useState<Record<string, SessionRuntimeState>>(
     () => initialTracker?.sessionRuntime ?? {},
   );
@@ -188,18 +584,34 @@ export function useHermesRpc(options: UseHermesRpcOptions = {}) {
   const [status, setStatus] = useState("Disconnected");
   const [busy, setBusy] = useState(false);
   const [overlay, setOverlay] = useState<OverlayState>(EMPTY_OVERLAY);
+  const [attentionRequests, setAttentionRequests] = useState<AttentionRequest[]>([]);
+  const attentionRequestsRef = useRef<AttentionRequest[]>([]);
+  const [missionSummaries, setMissionSummaries] = useState<Record<string, MissionSummary>>(() => loadMissionSummaries());
   const wsRef = useRef<WebSocket | null>(null);
   const nextId = useRef(1);
   const pending = useRef<Map<number, Pending>>(new Map());
   const streamingMessageId = useRef<string | null>(null);
   const messagesRef = useRef<ChatMessage[]>([]);
+  const sessionTranscriptsRef = useRef<Record<string, ChatMessage[]>>({});
   const autoResumeOnConnectRef = useRef(options.autoResumeOnConnect ?? false);
   const sessionIdRef = useRef<string | null>(null);
   const knownGatewayIdsRef = useRef<Set<string>>(
     new Set(initialTracker?.knownGatewayIds ?? []),
   );
+  const guiTrackedSessionIdsRef = useRef<Set<string>>(
+    new Set(initialTracker?.guiTrackedSessionIds ?? []),
+  );
+  const [guiTrackedSessionIds, setGuiTrackedSessionIds] = useState<Set<string>>(
+    () => new Set(initialTracker?.guiTrackedSessionIds ?? []),
+  );
+  const [sessionPurposeTitles, setSessionPurposeTitles] = useState<Record<string, string>>(
+    () => initialTracker?.sessionPurposeTitles ?? {},
+  );
   const lastActiveDbSessionKeyRef = useRef<string | undefined>(
     initialTracker?.lastActiveDbSessionKey,
+  );
+  const [trackedDbSessionId, setTrackedDbSessionId] = useState<string | null>(
+    initialTracker?.lastActiveDbSessionKey ?? null,
   );
   const lastActiveGatewaySessionIdRef = useRef<string | undefined>(
     initialTracker?.lastActiveGatewaySessionId,
@@ -209,10 +621,16 @@ export function useHermesRpc(options: UseHermesRpcOptions = {}) {
   const gatewayIdBySessionKeyRef = useRef<Record<string, string>>({});
   const promptQueueRef = useRef<string[]>([]);
   const drainingQueueRef = useRef(false);
+  const titleSyncInFlightRef = useRef(new Set<string>());
+  const titleSyncTimersRef = useRef(new Map<string, ReturnType<typeof setTimeout>>());
 
   useEffect(() => {
     promptQueueRef.current = promptQueue;
   }, [promptQueue]);
+
+  useEffect(() => {
+    attentionRequestsRef.current = attentionRequests;
+  }, [attentionRequests]);
 
   const sessionRuntimeRef = useRef(sessionRuntime);
   useEffect(() => {
@@ -231,29 +649,82 @@ export function useHermesRpc(options: UseHermesRpcOptions = {}) {
     autoResumeOnConnectRef.current = options.autoResumeOnConnect ?? true;
   }, [options.autoResumeOnConnect]);
 
+  useEffect(() => {
+    guiTrackedSessionIdsRef.current = guiTrackedSessionIds;
+  }, [guiTrackedSessionIds]);
+
+  useEffect(() => {
+    if (guiTrackedSessionIds.size > 0) return;
+    const seed = [lastActiveGatewaySessionIdRef.current, lastActiveDbSessionKeyRef.current].filter(Boolean) as string[];
+    if (seed.length === 0) return;
+    setGuiTrackedSessionIds(new Set(seed));
+  }, [guiTrackedSessionIds.size]);
+
   const persistSessionTracker = useCallback(() => {
     const snapshot: SessionTrackerSnapshot = {
       sessionRuntime,
       sessionKeyByGatewayId,
       gatewayIdBySessionKey,
       knownGatewayIds: [...knownGatewayIdsRef.current],
+      guiTrackedSessionIds: [...guiTrackedSessionIdsRef.current],
+      sessionPurposeTitles,
       lastActiveDbSessionKey: lastActiveDbSessionKeyRef.current,
       lastActiveGatewaySessionId: lastActiveGatewaySessionIdRef.current,
     };
     saveSessionTracker(snapshot);
-  }, [gatewayIdBySessionKey, sessionKeyByGatewayId, sessionRuntime]);
+  }, [gatewayIdBySessionKey, guiTrackedSessionIds, sessionKeyByGatewayId, sessionPurposeTitles, sessionRuntime]);
+
+  const rememberSessionPurpose = useCallback((
+    promptText: string,
+    ids: Array<string | null | undefined>,
+    options: { force?: boolean } = {},
+  ) => {
+    const title = purposeTitleFromPrompt(promptText);
+    if (!title) return;
+    setSessionPurposeTitles((prev) => {
+      const next = { ...prev };
+      let changed = false;
+      for (const id of ids) {
+        const trimmed = id?.trim();
+        if (!trimmed) continue;
+        if (!options.force && next[trimmed]) continue;
+        if (next[trimmed] === title) continue;
+        next[trimmed] = title;
+        changed = true;
+      }
+      return changed ? next : prev;
+    });
+  }, []);
+
+  const trackGuiSession = useCallback((...ids: Array<string | null | undefined>) => {
+    setGuiTrackedSessionIds((prev) => {
+      const next = new Set(prev);
+      let changed = false;
+      for (const id of ids) {
+        const trimmed = id?.trim();
+        if (!trimmed || next.has(trimmed)) continue;
+        next.add(trimmed);
+        changed = true;
+      }
+      return changed ? next : prev;
+    });
+  }, []);
 
   const rememberActiveSession = useCallback((gatewayId: string | null, dbKey?: string | null) => {
     if (!gatewayId) return;
     lastActiveGatewaySessionIdRef.current = gatewayId;
-    if (dbKey) lastActiveDbSessionKeyRef.current = dbKey;
+    if (dbKey) {
+      lastActiveDbSessionKeyRef.current = dbKey;
+      setTrackedDbSessionId(dbKey);
+    }
   }, []);
 
   useEffect(() => {
     if (!sessionId) return;
     const dbKey = sessionKeyByGatewayId[sessionId] ?? null;
     rememberActiveSession(sessionId, dbKey);
-  }, [rememberActiveSession, sessionId, sessionKeyByGatewayId]);
+    trackGuiSession(sessionId, dbKey ?? undefined);
+  }, [rememberActiveSession, sessionId, sessionKeyByGatewayId, trackGuiSession]);
 
   useEffect(() => {
     const timer = setTimeout(() => {
@@ -265,6 +736,8 @@ export function useHermesRpc(options: UseHermesRpcOptions = {}) {
   const linkSessionIds = useCallback((gatewayId: string, dbKey: string) => {
     if (!gatewayId || !dbKey) return;
     knownGatewayIdsRef.current.add(gatewayId);
+    trackGuiSession(gatewayId, dbKey);
+    setSessionPurposeTitles((prev) => aliasPurposeTitles(prev, gatewayId, dbKey));
     setSessionKeyByGatewayId((prev) => ({ ...prev, [gatewayId]: dbKey }));
     setGatewayIdBySessionKey((prev) => ({ ...prev, [dbKey]: gatewayId }));
     setSessionRuntime((prev) => {
@@ -274,7 +747,7 @@ export function useHermesRpc(options: UseHermesRpcOptions = {}) {
       const merged = gatewayRuntime ?? dbRuntime!;
       return { ...prev, [gatewayId]: merged, [dbKey]: merged };
     });
-  }, []);
+  }, [trackGuiSession]);
 
   const rememberGatewaySession = useCallback((gatewayId: string) => {
     if (!gatewayId) return;
@@ -288,6 +761,18 @@ export function useHermesRpc(options: UseHermesRpcOptions = {}) {
   useEffect(() => {
     messagesRef.current = messages;
   }, [messages]);
+
+  useEffect(() => {
+    subagentsRef.current = subagents;
+  }, [subagents]);
+
+  useEffect(() => {
+    subagentsBySessionIdRef.current = subagentsBySessionId;
+  }, [subagentsBySessionId]);
+
+  useEffect(() => {
+    sessionsRef.current = sessions;
+  }, [sessions]);
 
   useEffect(() => {
     let cancelled = false;
@@ -316,19 +801,126 @@ export function useHermesRpc(options: UseHermesRpcOptions = {}) {
   }, []);
 
   const appendSystemMessage = useCallback((text: string, status?: ChatMessage["status"]) => {
-    const trimmed = text.trim();
-    if (!trimmed) return;
-    setMessages((prev) => [
-      ...prev,
-      {
-        id: `system-${Date.now()}-${Math.random().toString(36).slice(2)}`,
-        role: "system",
-        text: trimmed,
-        status,
-        createdAt: Date.now(),
-      },
-    ]);
+    setMessages((prev) => {
+      const next = appendSystemTranscriptMessage(prev, text, status);
+      if (next === prev) return prev;
+
+      streamingMessageId.current = null;
+      const gatewayId = sessionIdRef.current;
+      const dbKey = gatewayId ? sessionKeyByGatewayIdRef.current[gatewayId] : undefined;
+      persistSessionTranscript(
+        gatewayId,
+        dbKey,
+        next,
+        sessionTranscriptsRef.current,
+        sessionKeyByGatewayIdRef.current,
+        gatewayIdBySessionKeyRef.current,
+        { includeInProgress: true },
+      );
+      return next;
+    });
   }, []);
+
+  const appendAgentAction = useCallback((action: AgentAction) => {
+    appendSystemMessage(
+      serializeAgentAction(action),
+      action.status === "error" ? "error" : undefined,
+    );
+  }, [appendSystemMessage]);
+
+  const persistCompletedMissionSummary = useCallback((items: SubagentProgress[]) => {
+    const activeId = sessionIdRef.current;
+    if (!activeId || items.length === 0) return;
+
+    const allTerminal = items.every((item) =>
+      item.status === "completed" || item.status === "failed" || item.status === "interrupted",
+    );
+    if (!allTerminal) return;
+
+    const dbKey = sessionKeyByGatewayIdRef.current[activeId];
+    const title =
+      sessionsRef.current.find((session) => session.id === dbKey || session.id === activeId)?.title ??
+      activeId;
+    const completedAt =
+      items.reduce((latest, item) => {
+        const finishedAt =
+          item.startedAt != null && item.durationSeconds != null
+            ? item.startedAt + item.durationSeconds * 1000
+            : item.startedAt ?? latest;
+        return Math.max(latest, finishedAt);
+      }, 0) || Date.now();
+    const summary = createMissionSummary(activeId, title, items, completedAt);
+    if (summary.status === "running") return;
+
+    setMissionSummaries((prev) => {
+      const existing = prev[summary.sessionId];
+      if (
+        existing?.status === summary.status &&
+        existing?.completedAt === summary.completedAt &&
+        existing?.summaryText === summary.summaryText &&
+        existing?.agentCount === summary.agentCount &&
+        existing?.toolCount === summary.toolCount &&
+        existing?.filesTouched === summary.filesTouched
+      ) {
+        return prev;
+      }
+      const next = upsertMissionSummary(prev, summary, [activeId, dbKey]);
+      saveMissionSummaries(next);
+      return next;
+    });
+  }, []);
+
+  const sessionIdsForEvent = useCallback((eventSessionId: string) => {
+    const dbKey = sessionKeyByGatewayIdRef.current[eventSessionId];
+    return [eventSessionId, dbKey].filter(Boolean) as string[];
+  }, []);
+
+  const loadSubagentsForSession = useCallback((gatewayId: string) => {
+    const items = subagentsForAliases(
+      subagentsBySessionIdRef.current,
+      sessionIdsForEvent(gatewayId),
+    );
+    setSubagents(items);
+  }, [sessionIdsForEvent]);
+
+  const stashCurrentSessionSubagents = useCallback(() => {
+    const gatewayId = sessionIdRef.current;
+    if (!gatewayId) return;
+    setSubagentsBySessionId((prev) =>
+      stashSubagentsForSession(prev, sessionIdsForEvent(gatewayId), subagentsRef.current),
+    );
+  }, [sessionIdsForEvent]);
+
+  const clearSessionSubagents = useCallback((eventSessionId: string) => {
+    setSubagentsBySessionId((prev) =>
+      stashSubagentsForSession(prev, sessionIdsForEvent(eventSessionId), []),
+    );
+  }, [sessionIdsForEvent]);
+
+  const recordSubagentEvent = useCallback((
+    eventSessionId: string,
+    type: string,
+    data: SubagentEventPayload,
+  ) => {
+    const sessionIds = sessionIdsForEvent(eventSessionId);
+    setSubagentsBySessionId((prev) => applySubagentEventForSession(prev, sessionIds, type, data));
+
+    const isActive = eventMatchesActiveSession(
+      eventSessionId,
+      sessionIdRef.current,
+      sessionKeyByGatewayIdRef.current,
+      gatewayIdBySessionKeyRef.current,
+    );
+    if (!isActive) return;
+
+    setSubagents((prev) => {
+      const next = applySubagentEvent(prev, type, data);
+      if (type === "subagent.complete") {
+        persistCompletedMissionSummary(next);
+      }
+      return next;
+    });
+  }, [persistCompletedMissionSummary, sessionIdsForEvent]);
 
   const patchSessionRuntime = useCallback((sid: string, patch: Partial<SessionRuntimeState>) => {
     if (!sid) return;
@@ -369,6 +961,23 @@ export function useHermesRpc(options: UseHermesRpcOptions = {}) {
     patchSessionRuntime(sid, { running: true, blocked: true, activity });
   }, [patchSessionRuntime]);
 
+  const bumpSessionLastResponseAt = useCallback((targetSessionId: string, at = Date.now()) => {
+    if (!targetSessionId) return;
+    const keys = new Set<string>([targetSessionId]);
+    const dbKey = sessionKeyByGatewayIdRef.current[targetSessionId];
+    if (dbKey) keys.add(dbKey);
+    const gatewayId = gatewayIdBySessionKeyRef.current[targetSessionId];
+    if (gatewayId) keys.add(gatewayId);
+
+    setSessionLastResponseAt((prev) => {
+      const next = { ...prev };
+      for (const key of keys) {
+        next[key] = Math.max(prev[key] ?? 0, at);
+      }
+      return next;
+    });
+  }, []);
+
   const rpc = useCallback((method: string, params: Record<string, unknown> = {}) => {
     const ws = wsRef.current;
     if (!ws || ws.readyState !== WebSocket.OPEN) {
@@ -388,6 +997,55 @@ export function useHermesRpc(options: UseHermesRpcOptions = {}) {
     });
   }, []);
 
+  const applyGatewaySessionTitle = useCallback((
+    gatewayId: string,
+    dbKey: string | null | undefined,
+    title: string,
+  ) => {
+    const normalized = normalizeGatewaySessionTitle(title);
+    if (!normalized) return;
+    rememberSessionPurpose(normalized, [gatewayId, dbKey], { force: false });
+    if (dbKey) {
+      setSessions((prev) => prev.map((session) =>
+        session.id === dbKey && (!session.title?.trim() || /^Running · /i.test(session.title))
+          ? { ...session, title: normalized }
+          : session,
+      ));
+    }
+  }, [rememberSessionPurpose]);
+
+  const syncSessionTitleFromGateway = useCallback(async (gatewayId: string) => {
+    if (!gatewayId || titleSyncInFlightRef.current.has(gatewayId)) return;
+    titleSyncInFlightRef.current.add(gatewayId);
+    try {
+      const result: any = await rpc("session.title", { session_id: gatewayId });
+      const dbKey = sessionKeyByGatewayIdRef.current[gatewayId] ?? null;
+      applyGatewaySessionTitle(gatewayId, dbKey, String(result?.title ?? ""));
+    } catch {
+      // Auto-title may still be generating in Hermes.
+    } finally {
+      titleSyncInFlightRef.current.delete(gatewayId);
+    }
+  }, [applyGatewaySessionTitle, rpc]);
+
+  const scheduleSessionTitleSync = useCallback((gatewayId: string, delayMs = 0) => {
+    if (!gatewayId) return;
+    const existing = titleSyncTimersRef.current.get(gatewayId);
+    if (existing) clearTimeout(existing);
+    const timer = setTimeout(() => {
+      titleSyncTimersRef.current.delete(gatewayId);
+      void syncSessionTitleFromGateway(gatewayId);
+    }, delayMs);
+    titleSyncTimersRef.current.set(gatewayId, timer);
+  }, [syncSessionTitleFromGateway]);
+
+  useEffect(() => () => {
+    for (const timer of titleSyncTimersRef.current.values()) {
+      clearTimeout(timer);
+    }
+    titleSyncTimersRef.current.clear();
+  }, []);
+
   const respondWith = useCallback(
     async (method: string, params: Record<string, unknown>, onDone: () => void) => {
       try {
@@ -402,78 +1060,173 @@ export function useHermesRpc(options: UseHermesRpcOptions = {}) {
     [rpc],
   );
 
+  const dismissAttentionRequest = useCallback((requestId: string | undefined) => {
+    if (!requestId) return;
+    setAttentionRequests((prev) => removeAttentionRequest(prev, requestId));
+  }, []);
+
+  const recordAttentionRequest = useCallback((type: string, data: Record<string, unknown>, eventSessionId: string) => {
+    if (!eventSessionId) return null;
+    if (!["approval.request", "clarify.request", "sudo.request", "secret.request"].includes(type)) return null;
+    const request = attentionRequestFromEvent(type, data, eventSessionId);
+    setAttentionRequests((prev) => upsertAttentionRequest(prev, request));
+    return request;
+  }, []);
+
+  const openAttentionRequest = useCallback((requestId: string) => {
+    const request = attentionRequestsRef.current.find((item) => item.id === requestId);
+    if (!request) {
+      setStatus("Attention request is no longer available");
+      return;
+    }
+    setOverlay((prev) => ({ ...prev, ...overlayPatchFromAttention(request) }));
+    setStatus(`${request.title} · ${request.sessionId.slice(0, 8)}`);
+  }, []);
+
+  const attentionRequestForOverlay = useCallback((attentionId?: string) => {
+    if (!attentionId) return null;
+    return attentionRequestsRef.current.find((item) => item.id === attentionId) ?? null;
+  }, []);
+
+  const attentionTargetSession = useCallback((sessionId?: string) => (
+    sessionId ? resolveGatewaySessionId(
+      sessionId,
+      sessionKeyByGatewayIdRef.current,
+      gatewayIdBySessionKeyRef.current,
+      knownGatewayIdsRef.current,
+    ) ?? sessionId : sessionIdRef.current
+  ), []);
+
+  const persistStoredTranscriptUpdate = useCallback((
+    targetSessionId: string,
+    updater: (messages: ChatMessage[]) => ChatMessage[],
+  ) => {
+    if (!targetSessionId) return;
+    const { gatewayId, dbKey } = resolveStoredSessionKeys(
+      targetSessionId,
+      sessionKeyByGatewayIdRef.current,
+      gatewayIdBySessionKeyRef.current,
+      knownGatewayIdsRef.current,
+    );
+    const current = recallSessionTranscript(
+      gatewayId,
+      dbKey,
+      sessionTranscriptsRef.current,
+      sessionKeyByGatewayIdRef.current,
+      gatewayIdBySessionKeyRef.current,
+    );
+    const next = updater(current);
+    if (next.length === 0) return;
+    persistSessionTranscript(
+      gatewayId,
+      dbKey,
+      next,
+      sessionTranscriptsRef.current,
+      sessionKeyByGatewayIdRef.current,
+      gatewayIdBySessionKeyRef.current,
+      { includeInProgress: true },
+    );
+  }, []);
+
   const answerApproval = useCallback(
     (choice: ApprovalChoice) => {
-      const sid = sessionIdRef.current;
+      const approval = overlay.approval;
+      const sid = attentionTargetSession(approval?.sessionId);
       if (!sid) return;
       void respondWith("approval.respond", { session_id: sid, choice }, () => {
+        dismissAttentionRequest(approval?.attentionId);
         setOverlay((prev) => ({ ...prev, approval: null }));
         setStatus(choice === "deny" ? "Approval denied" : "running…");
       });
     },
-    [respondWith],
+    [attentionTargetSession, dismissAttentionRequest, overlay.approval, respondWith],
   );
 
   const answerClarify = useCallback(
     (answer: string) => {
       const clarify = overlay.clarify;
       if (!clarify) return;
+      const targetSessionId = clarify.sessionId;
+      const sid = attentionTargetSession(targetSessionId);
       void respondWith(
         "clarify.respond",
-        { request_id: clarify.requestId, answer },
+        { request_id: clarify.requestId, answer, ...(sid ? { session_id: sid } : {}) },
         () => {
           if (answer) {
-            setMessages((prev) => [
-              ...prev,
-              {
-                id: `clarify-${Date.now()}`,
-                role: "user",
-                text: answer,
-                createdAt: Date.now(),
-              },
-            ]);
+            const message: ChatMessage = {
+              id: `clarify-${Date.now()}`,
+              role: "user",
+              text: answer,
+              createdAt: Date.now(),
+            };
+            const targetsActiveSession = !targetSessionId || eventMatchesActiveSession(
+              targetSessionId,
+              sessionIdRef.current,
+              sessionKeyByGatewayIdRef.current,
+              gatewayIdBySessionKeyRef.current,
+            );
+            if (targetsActiveSession) {
+              setMessages((prev) => [...prev, message]);
+            } else {
+              persistStoredTranscriptUpdate(targetSessionId, (messages) => [...messages, message]);
+            }
             setStatus("running…");
           } else {
             setStatus("Prompt cancelled");
           }
+          dismissAttentionRequest(clarify.attentionId);
           setOverlay((prev) => ({ ...prev, clarify: null }));
         },
       );
     },
-    [overlay.clarify, respondWith],
+    [attentionTargetSession, dismissAttentionRequest, overlay.clarify, persistStoredTranscriptUpdate, respondWith],
   );
 
   const answerSudo = useCallback(
     (password: string) => {
       const sudo = overlay.sudo;
       if (!sudo) return;
+      const sid = attentionTargetSession(sudo.sessionId);
       void respondWith(
         "sudo.respond",
-        { request_id: sudo.requestId, password },
+        { request_id: sudo.requestId, password, ...(sid ? { session_id: sid } : {}) },
         () => {
+          dismissAttentionRequest(sudo.attentionId);
           setOverlay((prev) => ({ ...prev, sudo: null }));
           setStatus(password ? "running…" : "sudo cancelled");
         },
       );
     },
-    [overlay.sudo, respondWith],
+    [attentionTargetSession, dismissAttentionRequest, overlay.sudo, respondWith],
   );
 
   const answerSecret = useCallback(
     (value: string) => {
       const secret = overlay.secret;
       if (!secret) return;
+      const sid = attentionTargetSession(secret.sessionId);
       void respondWith(
         "secret.respond",
-        { request_id: secret.requestId, value },
+        { request_id: secret.requestId, value, ...(sid ? { session_id: sid } : {}) },
         () => {
+          dismissAttentionRequest(secret.attentionId);
           setOverlay((prev) => ({ ...prev, secret: null }));
           setStatus(value ? "running…" : "Secret entry cancelled");
         },
       );
     },
-    [overlay.secret, respondWith],
+    [attentionTargetSession, dismissAttentionRequest, overlay.secret, respondWith],
   );
+
+  const appendBackgroundSystemMessage = useCallback((
+    eventSessionId: string,
+    text: string,
+    status?: ChatMessage["status"],
+  ) => {
+    persistStoredTranscriptUpdate(eventSessionId, (messages) =>
+      appendSystemTranscriptMessage(messages, text, status),
+    );
+  }, [persistStoredTranscriptUpdate]);
 
   const handleEvent = useCallback((frame: RpcFrame) => {
     const type = eventType(frame);
@@ -482,6 +1235,7 @@ export function useHermesRpc(options: UseHermesRpcOptions = {}) {
 
     const eventSessionId = sessionIdFromFrame(frame) ?? "";
     const activeSessionId = sessionIdRef.current;
+    const attentionRequest = recordAttentionRequest(type, data, eventSessionId || activeSessionId || "");
 
     const trackRuntime = () => {
       if (!eventSessionId) return;
@@ -577,6 +1331,106 @@ export function useHermesRpc(options: UseHermesRpcOptions = {}) {
       ) &&
       !type.startsWith("gateway.")
     ) {
+      switch (type) {
+        case "thinking.delta":
+        case "reasoning.delta": {
+          const snippet = String(data.text ?? "");
+          if (snippet) {
+            persistStoredTranscriptUpdate(eventSessionId, (messages) =>
+              applyReasoningDeltaToMessages(messages, snippet),
+            );
+          }
+          break;
+        }
+        case "reasoning.available": {
+          const snippet = String(data.text ?? "").trim();
+          if (snippet) {
+            persistStoredTranscriptUpdate(eventSessionId, (messages) => {
+              const streamingId = findActiveReasoningTargetId(messages);
+              if (streamingId) {
+                return messages.map((message) =>
+                  message.id === streamingId
+                    ? {
+                        ...message,
+                        reasoning: message.reasoning?.includes(snippet)
+                          ? message.reasoning
+                          : `${message.reasoning ?? ""}${snippet}`,
+                      }
+                    : message,
+                );
+              }
+              return appendReasoningSnippet(messages, snippet).messages;
+            });
+          }
+          break;
+        }
+        case "message.start": {
+          persistStoredTranscriptUpdate(eventSessionId, (messages) => {
+            if (findStreamingAssistantId(messages)) return messages;
+            return appendStreamingAssistantBubble(messages).messages;
+          });
+          break;
+        }
+        case "message.delta": {
+          const text = String(data.text ?? "");
+          if (!text) break;
+          persistStoredTranscriptUpdate(eventSessionId, (messages) => {
+            const streamingId = findStreamingAssistantId(messages);
+            if (streamingId) {
+              return messages.map((message) =>
+                message.id === streamingId
+                  ? { ...message, text: message.text + text }
+                  : message,
+              );
+            }
+            const { messages: next, id } = appendStreamingAssistantBubble(messages);
+            return next.map((message) =>
+              message.id === id ? { ...message, text: message.text + text } : message,
+            );
+          });
+          break;
+        }
+        case "message.complete": {
+          const text = String(data.text ?? "");
+          const reasoning = String(data.reasoning ?? "").trim();
+          persistStoredTranscriptUpdate(eventSessionId, (messages) =>
+            applyMessageCompleteToMessages(
+              messages,
+              text,
+              reasoning,
+              (data.status as ChatMessage["status"]) ?? "complete",
+            ),
+          );
+          bumpSessionLastResponseAt(eventSessionId);
+          scheduleSessionTitleSync(eventSessionId, 2500);
+          break;
+        }
+        case "tool.start":
+        case "tool.complete":
+        case "status.update":
+        case "approval.request":
+        case "clarify.request":
+        case "sudo.request":
+        case "secret.request": {
+          const activityAction = liveActivityAction(type, data);
+          const activityText = liveActivityMessageText(type, data);
+          if (activityText && activityAction && isRenderableActivity(activityAction)) {
+            appendBackgroundSystemMessage(eventSessionId, activityText);
+          }
+          break;
+        }
+        case "subagent.spawn_requested":
+        case "subagent.start":
+        case "subagent.thinking":
+        case "subagent.tool":
+        case "subagent.progress":
+        case "subagent.complete":
+          recordSubagentEvent(eventSessionId, type, data as SubagentEventPayload);
+          break;
+        default:
+          break;
+      }
+
       const backgroundActivity =
         type === "tool.start"
           ? `Running ${String(data.name ?? "tool")}…`
@@ -600,7 +1454,6 @@ export function useHermesRpc(options: UseHermesRpcOptions = {}) {
         break;
       case "message.start": {
         setBusy(true);
-        setSubagents([]);
         setMessages((prev) => {
           const { messages, id } = appendStreamingAssistantBubble(prev);
           streamingMessageId.current = id;
@@ -609,12 +1462,27 @@ export function useHermesRpc(options: UseHermesRpcOptions = {}) {
         break;
       }
       case "message.delta": {
-        const id = streamingMessageId.current;
         const text = String(data.text ?? "");
-        if (!id || !text) break;
-        setMessages((prev) =>
-          prev.map((m) => (m.id === id ? { ...m, text: m.text + text } : m)),
-        );
+        if (!text) break;
+        setMessages((prev) => {
+          let id = streamingMessageId.current;
+          const activeTarget = id && prev.some((message) => message.id === id && message.status === "streaming")
+            ? id
+            : findActiveReasoningTargetId(prev);
+          if (activeTarget) {
+            id = activeTarget;
+            streamingMessageId.current = activeTarget;
+            return prev.map((message) =>
+              message.id === id ? { ...message, text: message.text + text } : message,
+            );
+          }
+
+          const { messages: next, id: createdId } = appendStreamingAssistantBubble(prev);
+          streamingMessageId.current = createdId;
+          return next.map((message) =>
+            message.id === createdId ? { ...message, text: message.text + text } : message,
+          );
+        });
         break;
       }
       case "thinking.delta":
@@ -623,13 +1491,9 @@ export function useHermesRpc(options: UseHermesRpcOptions = {}) {
         if (!snippet) break;
         setBusy(true);
         setMessages((prev) => {
-          const { messages: withBubble, id } = appendStreamingAssistantBubble(prev);
+          const { messages: next, id } = appendReasoningSnippet(prev, snippet);
           streamingMessageId.current = id;
-          return withBubble.map((message) =>
-            message.id === id
-              ? { ...message, reasoning: `${message.reasoning ?? ""}${snippet}` }
-              : message,
-          );
+          return next;
         });
         break;
       }
@@ -638,56 +1502,104 @@ export function useHermesRpc(options: UseHermesRpcOptions = {}) {
         if (!snippet) break;
         setBusy(true);
         setMessages((prev) => {
-          const { messages: withBubble, id } = appendStreamingAssistantBubble(prev);
+          const streamingId = findActiveReasoningTargetId(prev);
+          if (streamingId) {
+            streamingMessageId.current = streamingId;
+            return prev.map((message) =>
+              message.id === streamingId
+                ? {
+                    ...message,
+                    reasoning: message.reasoning?.includes(snippet)
+                      ? message.reasoning
+                      : `${message.reasoning ?? ""}${snippet}`,
+                  }
+                : message,
+            );
+          }
+          const { messages: next, id } = appendReasoningSnippet(prev, snippet);
           streamingMessageId.current = id;
-          return withBubble.map((message) =>
-            message.id === id
-              ? {
-                  ...message,
-                  reasoning: message.reasoning?.includes(snippet)
-                    ? message.reasoning
-                    : `${message.reasoning ?? ""}${snippet}`,
-                }
-              : message,
-          );
+          return next;
         });
         break;
       }
       case "message.complete": {
         const id = streamingMessageId.current;
-        const text = String(data.text ?? "");
+        const text =
+          String(data.text ?? "").trim() ||
+          joinSubagentSummaries(subagentsRef.current);
         const reasoning = String(data.reasoning ?? "").trim();
         setBusy(false);
+        persistCompletedMissionSummary(subagentsRef.current);
         setTools((prev) => prev.map((t) => ({ ...t, status: "complete" })));
         if (id) {
           setMessages((prev) => {
-            const next = prev.map((m) =>
-              m.id === id
-                ? {
-                    ...m,
-                    text: text || m.text,
-                    reasoning: reasoning || m.reasoning,
-                    status: data.status ?? "complete",
-                  }
-                : m,
+            const next = coalesceAssistantReasoningTurns(
+              prev.map((m) =>
+                m.id === id
+                  ? {
+                      ...m,
+                      text: text || m.text,
+                      reasoning: reasoning || m.reasoning,
+                      status: data.status ?? "complete",
+                    }
+                  : m,
+              ),
             );
             const gatewayId = sessionIdRef.current;
             const dbKey = gatewayId ? sessionKeyByGatewayIdRef.current[gatewayId] : undefined;
-            persistSessionTranscript(gatewayId, dbKey, next);
+            persistSessionTranscript(
+              gatewayId,
+              dbKey,
+              next,
+              sessionTranscriptsRef.current,
+              sessionKeyByGatewayIdRef.current,
+              gatewayIdBySessionKeyRef.current,
+            );
+            return next;
+          });
+        } else {
+          setMessages((prev) => {
+            const next = coalesceAssistantReasoningTurns(
+              applyMessageCompleteToMessages(
+                prev,
+                text,
+                reasoning,
+                (data.status as ChatMessage["status"]) ?? "complete",
+              ),
+            );
+            const gatewayId = sessionIdRef.current;
+            const dbKey = gatewayId ? sessionKeyByGatewayIdRef.current[gatewayId] : undefined;
+            persistSessionTranscript(
+              gatewayId,
+              dbKey,
+              next,
+              sessionTranscriptsRef.current,
+              sessionKeyByGatewayIdRef.current,
+              gatewayIdBySessionKeyRef.current,
+            );
             return next;
           });
         }
         streamingMessageId.current = null;
         void refreshSessionsRef.current();
+        {
+          const gatewayId = sessionIdRef.current;
+          if (gatewayId) {
+            bumpSessionLastResponseAt(gatewayId);
+            scheduleSessionTitleSync(gatewayId, 2500);
+          }
+        }
         break;
       }
       case "tool.start":
         setBusy(true);
-        setMessages((prev) => {
-          const { messages, id } = appendStreamingAssistantBubble(prev);
-          streamingMessageId.current = id;
-          return messages;
-        });
+        {
+          const activityAction = liveActivityAction(type, data);
+          const activityText = liveActivityMessageText(type, data);
+          if (activityText && activityAction && isRenderableActivity(activityAction)) {
+            appendSystemMessage(activityText);
+          }
+        }
         setTools((prev) => [
           {
             id: data.tool_id ?? `${Date.now()}`,
@@ -721,6 +1633,8 @@ export function useHermesRpc(options: UseHermesRpcOptions = {}) {
                   ...t,
                   status: data.error ? "error" : "complete",
                   result: data.result ?? data.preview,
+                  summary: data.summary != null ? String(data.summary) : t.summary,
+                  inlineDiff: extractInlineDiff(data) ?? t.inlineDiff,
                   error: data.error ? String(data.error) : undefined,
                   completedAt: Date.now(),
                   rawPayload: data,
@@ -728,58 +1642,106 @@ export function useHermesRpc(options: UseHermesRpcOptions = {}) {
               : t,
           ),
         );
+        {
+          const activityAction = liveActivityAction(type, data);
+          if (activityAction && isRenderableActivity(activityAction)) {
+            appendAgentAction(activityAction);
+          }
+        }
         break;
-      case "status.update":
-        setMessages((prev) => [
-          ...prev,
-          { id: `status-${Date.now()}`, role: "system", text: String(data.text ?? ""), createdAt: Date.now() },
-        ]);
+      case "status.update": {
+        const activityAction = liveActivityAction(type, data);
+        const activityText = liveActivityMessageText(type, data);
+        if (activityText && activityAction && isRenderableActivity(activityAction)) {
+          appendSystemMessage(activityText);
+        }
         break;
+      }
       case "approval.request":
-        setOverlay((prev) => ({
-          ...prev,
-          approval: {
-            command: String(data.command ?? ""),
-            description: String(data.description ?? "dangerous command"),
-          },
-        }));
+        {
+          const activityAction = liveActivityAction(type, data);
+          if (activityAction) appendAgentAction(activityAction);
+        }
+        if (attentionRequest) {
+          setOverlay((prev) => ({ ...prev, ...overlayPatchFromAttention(attentionRequest) }));
+        } else {
+          setOverlay((prev) => ({
+            ...prev,
+            approval: {
+              command: String(data.command ?? ""),
+              description: String(data.description ?? "dangerous command"),
+              sessionId: eventSessionId || activeSessionId || undefined,
+            },
+          }));
+        }
         setStatus("approval needed");
         break;
       case "clarify.request":
-        setOverlay((prev) => ({
-          ...prev,
-          clarify: {
-            question: String(data.question ?? ""),
-            choices: Array.isArray(data.choices) ? data.choices.map(String) : null,
-            requestId: String(data.request_id ?? ""),
-          },
-        }));
+        {
+          const activityAction = liveActivityAction(type, data);
+          if (activityAction) appendAgentAction(activityAction);
+        }
+        if (attentionRequest) {
+          setOverlay((prev) => ({ ...prev, ...overlayPatchFromAttention(attentionRequest) }));
+        } else {
+          setOverlay((prev) => ({
+            ...prev,
+            clarify: {
+              question: String(data.question ?? ""),
+              choices: Array.isArray(data.choices) ? data.choices.map(String) : null,
+              requestId: String(data.request_id ?? ""),
+              sessionId: eventSessionId || activeSessionId || undefined,
+            },
+          }));
+        }
         setStatus("waiting for input…");
         break;
       case "sudo.request":
-        setOverlay((prev) => ({
-          ...prev,
-          sudo: { requestId: String(data.request_id ?? "") },
-        }));
+        {
+          const activityAction = liveActivityAction(type, data);
+          if (activityAction) appendAgentAction(activityAction);
+        }
+        if (attentionRequest) {
+          setOverlay((prev) => ({ ...prev, ...overlayPatchFromAttention(attentionRequest) }));
+        } else {
+          setOverlay((prev) => ({
+            ...prev,
+            sudo: {
+              requestId: String(data.request_id ?? ""),
+              sessionId: eventSessionId || activeSessionId || undefined,
+            },
+          }));
+        }
         setStatus("sudo password needed");
         break;
       case "secret.request":
-        setOverlay((prev) => ({
-          ...prev,
-          secret: {
-            envVar: String(data.env_var ?? ""),
-            prompt: String(data.prompt ?? "Secret required"),
-            requestId: String(data.request_id ?? ""),
-          },
-        }));
+        {
+          const activityAction = liveActivityAction(type, data);
+          if (activityAction) appendAgentAction(activityAction);
+        }
+        if (attentionRequest) {
+          setOverlay((prev) => ({ ...prev, ...overlayPatchFromAttention(attentionRequest) }));
+        } else {
+          setOverlay((prev) => ({
+            ...prev,
+            secret: {
+              envVar: String(data.env_var ?? ""),
+              prompt: String(data.prompt ?? "Secret required"),
+              requestId: String(data.request_id ?? ""),
+              sessionId: eventSessionId || activeSessionId || undefined,
+            },
+          }));
+        }
         setStatus("secret input needed");
         break;
       case "error":
         setBusy(false);
-        setMessages((prev) => [
-          ...prev,
-          { id: `error-${Date.now()}`, role: "system", text: `Error: ${data.message ?? "unknown"}`, status: "error", createdAt: Date.now() },
-        ]);
+        appendAgentAction({
+          kind: "error",
+          title: "Error",
+          detail: String(data.message ?? "unknown"),
+          status: "error",
+        });
         break;
       case "subagent.spawn_requested":
       case "subagent.start":
@@ -787,9 +1749,7 @@ export function useHermesRpc(options: UseHermesRpcOptions = {}) {
       case "subagent.tool":
       case "subagent.progress":
       case "subagent.complete":
-        setSubagents((prev) =>
-          applySubagentEvent(prev, type, data as SubagentEventPayload),
-        );
+        recordSubagentEvent(eventSessionId, type, data as SubagentEventPayload);
         break;
       default:
         if (type.endsWith(".request")) {
@@ -804,22 +1764,71 @@ export function useHermesRpc(options: UseHermesRpcOptions = {}) {
           ]);
         }
     }
-  }, [markSessionBlocked, markSessionIdle, markSessionRunning, rememberGatewaySession]);
+  }, [appendAgentAction, appendBackgroundSystemMessage, appendSystemMessage, bumpSessionLastResponseAt, markSessionBlocked, markSessionIdle, markSessionRunning, persistStoredTranscriptUpdate, recordAttentionRequest, recordSubagentEvent, rememberGatewaySession, scheduleSessionTitleSync]);
 
   const runningSessionIds = useMemo(() => {
     const seen = new Set<string>();
     const ids: string[] = [];
-    for (const [id, state] of Object.entries(sessionRuntime)) {
-      if (!state.running) continue;
+    for (const id of Object.keys(sessionRuntime)) {
       const canonical = sessionKeyByGatewayId[id] ?? id;
       if (seen.has(canonical)) continue;
+      const runtime = resolveRuntimeForAliases(
+        runtimeAliasesForSession(canonical, sessionKeyByGatewayId, gatewayIdBySessionKey),
+        sessionRuntime,
+      );
+      if (!runtime?.running) continue;
       seen.add(canonical);
       ids.push(canonical);
     }
     return ids;
-  }, [sessionRuntime, sessionKeyByGatewayId]);
+  }, [gatewayIdBySessionKey, sessionRuntime, sessionKeyByGatewayId]);
 
-  const activeDbSessionId = sessionId ? sessionKeyByGatewayId[sessionId] ?? null : null;
+  useEffect(() => {
+    if (!connected) return;
+
+    const syncRunningTitles = () => {
+      const seen = new Set<string>();
+      for (const [runtimeId, runtime] of Object.entries(sessionRuntime)) {
+        if (!runtime.running) continue;
+        const gatewayId = fleetTargetGatewayId(
+          runtimeId,
+          sessionKeyByGatewayId,
+          gatewayIdBySessionKey,
+        );
+        if (!gatewayId || seen.has(gatewayId)) continue;
+        seen.add(gatewayId);
+
+        const dbKey = sessionKeyByGatewayId[gatewayId] ?? runtimeId;
+        const aliases = [gatewayId, dbKey];
+        const serverTitle = sessions.find((session) => session.id === dbKey)?.title;
+        if (!shouldSyncSessionTitle(dbKey, {
+          purposeTitles: sessionPurposeTitles,
+          aliasIds: aliases,
+          serverTitle,
+          context: { runtimeActivity: runtime.activity },
+        })) {
+          continue;
+        }
+        void syncSessionTitleFromGateway(gatewayId);
+      }
+    };
+
+    syncRunningTitles();
+    const interval = setInterval(syncRunningTitles, 5000);
+    return () => clearInterval(interval);
+  }, [
+    connected,
+    gatewayIdBySessionKey,
+    sessionKeyByGatewayId,
+    sessionPurposeTitles,
+    sessionRuntime,
+    sessions,
+    syncSessionTitleFromGateway,
+  ]);
+
+  const activeDbSessionId = sessionId
+    ? sessionKeyByGatewayId[sessionId] ?? trackedDbSessionId
+    : trackedDbSessionId;
 
   const unsavedLiveSessions = useMemo((): SessionSummary[] => {
     const listedIds = new Set(sessions.map((session) => session.id));
@@ -832,16 +1841,21 @@ export function useHermesRpc(options: UseHermesRpcOptions = {}) {
       seen.add(dbKey);
       extras.push({
         id: dbKey,
-        title: dbKey === activeDbSessionId ? "Current chat" : `Running · ${dbKey.slice(-6)}`,
+        title: resolveSessionPurposeTitle(dbKey, {
+          purposeTitles: sessionPurposeTitles,
+          aliasIds: [gatewayId],
+          serverTitle: dbKey === activeDbSessionId ? "Current chat" : undefined,
+        }) || (dbKey === activeDbSessionId ? "Current chat" : `Agent · ${dbKey.slice(0, 8)}`),
         preview: runtime.activity || "Agent running",
         started_at: runtime.updatedAt ?? Date.now(),
+        last_response_at: runtime.updatedAt ?? Date.now(),
         message_count: 0,
         source: "live",
       });
     }
 
     return extras;
-  }, [activeDbSessionId, sessionKeyByGatewayId, sessionRuntime, sessions]);
+  }, [activeDbSessionId, sessionKeyByGatewayId, sessionPurposeTitles, sessionRuntime, sessions]);
 
   const matchesActiveSession = useCallback(
     (target: string) => {
@@ -849,11 +1863,13 @@ export function useHermesRpc(options: UseHermesRpcOptions = {}) {
       return (
         target === sessionId ||
         target === activeDbSessionId ||
+        target === trackedDbSessionId ||
         gatewayIdBySessionKey[target] === sessionId ||
-        sessionKeyByGatewayId[target] === activeDbSessionId
+        sessionKeyByGatewayId[target] === activeDbSessionId ||
+        sessionKeyByGatewayId[target] === trackedDbSessionId
       );
     },
-    [activeDbSessionId, gatewayIdBySessionKey, sessionId, sessionKeyByGatewayId],
+    [activeDbSessionId, gatewayIdBySessionKey, sessionId, sessionKeyByGatewayId, trackedDbSessionId],
   );
 
   const backgroundRunningSessionId = useMemo(() => {
@@ -862,14 +1878,16 @@ export function useHermesRpc(options: UseHermesRpcOptions = {}) {
   }, [activeDbSessionId, runningSessionIds, sessionId]);
 
   const resolveSessionRuntime = useCallback((targetId: string): SessionRuntimeState | undefined => {
-    const direct = sessionRuntime[targetId];
-    if (direct) return direct;
-    const gatewayId = gatewayIdBySessionKey[targetId];
-    if (gatewayId) return sessionRuntime[gatewayId];
-    const dbKey = sessionKeyByGatewayId[targetId];
-    if (dbKey) return sessionRuntime[dbKey];
-    return undefined;
+    return resolveRuntimeForAliases(
+      runtimeAliasesForSession(targetId, sessionKeyByGatewayId, gatewayIdBySessionKey),
+      sessionRuntime,
+    );
   }, [gatewayIdBySessionKey, sessionKeyByGatewayId, sessionRuntime]);
+
+  const activeRuntime = sessionId
+    ? resolveSessionRuntime(activeDbSessionId ?? sessionId)
+    : undefined;
+  const activeSessionBusy = isComposerBusy(busy, activeRuntime);
 
   const syncGatewaySessionStatus = useCallback(async (gatewayId: string) => {
     if (!gatewayId) return;
@@ -892,6 +1910,20 @@ export function useHermesRpc(options: UseHermesRpcOptions = {}) {
       }
     }
   }, [linkSessionIds, markSessionIdle, markSessionRunning, rpc]);
+
+  /** Route live gateway events to this browser tab (Hermes binds async events to last RPC transport). */
+  const claimSessionTransport = useCallback(async (gatewayId: string) => {
+    if (!gatewayId) return;
+    try {
+      const result: any = await rpc("session.status", { session_id: gatewayId });
+      const parsed = parseSessionStatus(String(result?.output ?? ""));
+      if (parsed.sessionKey) {
+        linkSessionIds(gatewayId, parsed.sessionKey);
+      }
+    } catch {
+      // Session may have closed between listing and focus.
+    }
+  }, [linkSessionIds, rpc]);
 
   const applySessionSnapshot = useCallback((
     gatewayId: string,
@@ -929,16 +1961,41 @@ export function useHermesRpc(options: UseHermesRpcOptions = {}) {
     }
     rememberGatewaySession(gatewayId);
 
+    let resolvedMessages = messagesRef.current;
     if (updateTranscript && appliesToActiveSession) {
-      const nextMessages = options.transcript
-        ?? (snapshot.running ? appendInProgressBubble(mapHistoryMessages(snapshot.messages)) : mapHistoryMessages(snapshot.messages));
-      const streaming = nextMessages.find((message) => message.status === "streaming");
-      streamingMessageId.current = streaming?.id ?? null;
+      let nextMessages = coalesceAssistantReasoningTurns(
+        options.transcript
+          ?? (snapshot.running ? appendInProgressBubble(mapHistoryMessages(snapshot.messages)) : mapHistoryMessages(snapshot.messages)),
+      );
+      nextMessages = finalizePolledTranscript(nextMessages);
+      resolvedMessages = nextMessages;
+      const sessionActive = snapshotIndicatesActiveWork(snapshot, nextMessages);
+      if (!sessionActive) {
+        nextMessages = nextMessages.map((message) =>
+          message.status === "streaming"
+            ? { ...message, status: "complete" as const }
+            : message,
+        );
+        resolvedMessages = nextMessages;
+        streamingMessageId.current = null;
+      } else {
+        const streaming = nextMessages.find((message) => message.status === "streaming");
+        streamingMessageId.current = streaming?.id ?? null;
+      }
       setMessages(nextMessages);
-      persistSessionTranscript(gatewayId, dbKey || undefined, nextMessages);
+      persistSessionTranscript(
+        gatewayId,
+        dbKey || undefined,
+        nextMessages,
+        sessionTranscriptsRef.current,
+        sessionKeyByGatewayIdRef.current,
+        gatewayIdBySessionKeyRef.current,
+      );
     }
 
-    if (snapshot.running) {
+    const sessionActive = snapshotIndicatesActiveWork(snapshot, resolvedMessages);
+
+    if (sessionActive) {
       markSessionRunning(gatewayId, snapshot.activity || "Working…");
       if (appliesToActiveSession) {
         setBusy(true);
@@ -946,16 +2003,29 @@ export function useHermesRpc(options: UseHermesRpcOptions = {}) {
       }
     } else {
       markSessionIdle(gatewayId, "Ready");
-      if (appliesToActiveSession && updateTranscript) {
-        if (!streamingMessageId.current) {
-          setBusy(false);
-        }
+      if (appliesToActiveSession) {
+        streamingMessageId.current = null;
+        setBusy(false);
         setTools((prev) => prev.map((tool) => ({ ...tool, status: "complete" as const })));
       }
     }
 
     // Loaded transcripts are persisted locally so reconnects can recover history.
   }, [linkSessionIds, markSessionIdle, markSessionRunning, rememberGatewaySession]);
+
+  const stashCurrentSessionTranscript = useCallback(() => {
+    const gatewayId = sessionIdRef.current;
+    if (!gatewayId) return;
+    const dbKey = sessionKeyByGatewayIdRef.current[gatewayId];
+    stashActiveSessionTranscript(
+      gatewayId,
+      dbKey,
+      messagesRef.current,
+      sessionTranscriptsRef.current,
+      sessionKeyByGatewayIdRef.current,
+      gatewayIdBySessionKeyRef.current,
+    );
+  }, []);
 
   const loadSessionTranscript = useCallback(async (
     gatewayId: string,
@@ -974,13 +2044,28 @@ export function useHermesRpc(options: UseHermesRpcOptions = {}) {
       dbMessages = memoryMessages;
     }
 
+    const recalled = recallSessionTranscript(
+      gatewayId,
+      dbKey || undefined,
+      sessionTranscriptsRef.current,
+      sessionKeyByGatewayIdRef.current,
+      gatewayIdBySessionKeyRef.current,
+    );
     const cachedMessages = pickRicherTranscript(
       loadCachedTranscript(gatewayId),
       dbKey ? loadCachedTranscript(dbKey) : [],
     );
-    let merged = pickRicherTranscript(dbMessages, memoryMessages);
-    merged = pickRicherTranscript(merged, cachedMessages);
-    if (snapshot.running) merged = appendInProgressBubble(merged);
+    const localMessages = pickRicherTranscript(cachedMessages, recalled);
+    const serverBase = pickRicherTranscript(dbMessages, memoryMessages);
+    let merged = reconcileTranscriptHistory(serverBase, localMessages);
+    merged = enrichTranscriptWithReasoning(merged, localMessages);
+    merged = finalizeTranscriptHistory(merged);
+    if (
+      snapshot.running &&
+      (snapshot.active_tools.length > 0 || !transcriptTurnLooksComplete(merged))
+    ) {
+      merged = appendInProgressBubble(merged);
+    }
     return merged;
   }, [rpc]);
 
@@ -997,7 +2082,11 @@ export function useHermesRpc(options: UseHermesRpcOptions = {}) {
       transcript = await loadSessionTranscript(gatewayId, snapshot);
       if (options.mergeWithCurrent) {
         transcript = pickRicherTranscript(transcript, messagesRef.current);
+        transcript = enrichTranscriptWithReasoning(transcript, messagesRef.current);
+        transcript = mergeLiveActivityMessages(transcript, messagesRef.current);
       }
+      transcript = coalesceAssistantReasoningTurns(transcript);
+      transcript = finalizeTranscriptHistory(transcript);
     }
 
     applySessionSnapshot(gatewayId, snapshot, {
@@ -1008,17 +2097,13 @@ export function useHermesRpc(options: UseHermesRpcOptions = {}) {
   }, [applySessionSnapshot, loadSessionTranscript, url]);
 
   const findLiveGatewayForTarget = useCallback(
-    (target: string, live: Awaited<ReturnType<typeof fetchLiveGatewaySessions>>): string | null => {
-      if (!target) return null;
-      // Only match against the live gateway snapshot — cached refs go stale and
-      // can incorrectly route an old db session id to a different live agent.
-      for (const session of live) {
-        if (session.gateway_id === target || session.session_key === target) {
-          return session.gateway_id;
-        }
-      }
-      return null;
-    },
+    (target: string, live: Awaited<ReturnType<typeof fetchLiveGatewaySessions>>): string | null =>
+      resolveLiveGatewayForTarget(
+        target,
+        live,
+        sessionKeyByGatewayIdRef.current,
+        gatewayIdBySessionKeyRef.current,
+      ),
     [],
   );
 
@@ -1032,12 +2117,19 @@ export function useHermesRpc(options: UseHermesRpcOptions = {}) {
       }
     }
 
-    const dbByGateway: Record<string, string> = {};
-    const gatewayByDb: Record<string, string> = {};
+    const dbByGateway: Record<string, string> = { ...sessionKeyByGatewayIdRef.current };
+    const gatewayByDb: Record<string, string> = { ...gatewayIdBySessionKeyRef.current };
     for (const session of live) {
       if (session.session_key) {
         dbByGateway[session.gateway_id] = session.session_key;
         gatewayByDb[session.session_key] = session.gateway_id;
+      }
+    }
+    for (const [dbKey, gatewayId] of Object.entries(gatewayByDb)) {
+      if (liveGatewayIds.has(gatewayId) || gatewayId === sessionIdRef.current) continue;
+      delete gatewayByDb[dbKey];
+      if (dbByGateway[gatewayId] === dbKey) {
+        delete dbByGateway[gatewayId];
       }
     }
     sessionKeyByGatewayIdRef.current = dbByGateway;
@@ -1045,8 +2137,17 @@ export function useHermesRpc(options: UseHermesRpcOptions = {}) {
     setSessionKeyByGatewayId(dbByGateway);
     setGatewayIdBySessionKey(gatewayByDb);
 
+    const savedDbIds = new Set(sessionsRef.current.map((session) => session.id));
+    const shouldTrackLiveSession = (gatewayId: string, sessionKey: string) =>
+      guiTrackedSessionIdsRef.current.has(gatewayId) ||
+      (sessionKey && guiTrackedSessionIdsRef.current.has(sessionKey)) ||
+      (sessionKey && savedDbIds.has(sessionKey)) ||
+      gatewayId === sessionIdRef.current ||
+      sessionKey === lastActiveDbSessionKeyRef.current;
+
     for (const session of live) {
       rememberGatewaySession(session.gateway_id);
+      if (!shouldTrackLiveSession(session.gateway_id, session.session_key)) continue;
       if (session.running) {
         markSessionRunning(session.gateway_id, session.activity || "Working…");
         if (session.session_key) {
@@ -1064,7 +2165,20 @@ export function useHermesRpc(options: UseHermesRpcOptions = {}) {
       const next = { ...prev };
       for (const id of Object.keys(next)) {
         const gatewayId = gatewayIdBySessionKeyRef.current[id] ?? id;
-        if (!liveGatewayIds.has(id) && !liveGatewayIds.has(gatewayId)) {
+        const dbKey = sessionKeyByGatewayIdRef.current[id] ?? sessionKeyByGatewayIdRef.current[gatewayId];
+        const stillLive = liveGatewayIds.has(id) || liveGatewayIds.has(gatewayId);
+        const tracked =
+          guiTrackedSessionIdsRef.current.has(id) ||
+          guiTrackedSessionIdsRef.current.has(gatewayId) ||
+          (dbKey ? guiTrackedSessionIdsRef.current.has(dbKey) : false) ||
+          (dbKey ? savedDbIds.has(dbKey) : false) ||
+          id === sessionIdRef.current ||
+          gatewayId === sessionIdRef.current;
+        if (!stillLive) {
+          delete next[id];
+          continue;
+        }
+        if (!tracked && !next[id]?.running && !next[id]?.blocked) {
           delete next[id];
         }
       }
@@ -1076,14 +2190,11 @@ export function useHermesRpc(options: UseHermesRpcOptions = {}) {
 
   const focusLiveSession = useCallback(async (gatewayId: string) => {
     if (!gatewayId) throw new Error("Missing gateway session id");
-    rememberGatewaySession(gatewayId);
-    setSessionId(gatewayId);
-    sessionIdRef.current = gatewayId;
-    setOverlay(EMPTY_OVERLAY);
-    setSubagents([]);
-    setPromptQueue([]);
+    const previousGatewayId = sessionIdRef.current;
+    await claimSessionTransport(gatewayId);
 
-    const snapshot = await syncSessionView(gatewayId);
+    const switchingSessions = Boolean(previousGatewayId && previousGatewayId !== gatewayId);
+    const snapshot = await fetchSessionSnapshot(url, gatewayId);
     if (!snapshot) {
       const [historyResult, statusResult]: any[] = await Promise.all([
         rpc("session.history", { session_id: gatewayId }),
@@ -1093,17 +2204,6 @@ export function useHermesRpc(options: UseHermesRpcOptions = {}) {
       if (parsed.sessionKey) {
         linkSessionIds(gatewayId, parsed.sessionKey);
       }
-      const stillActive = eventMatchesActiveSession(
-        gatewayId,
-        sessionIdRef.current,
-        parsed.sessionKey
-          ? { ...sessionKeyByGatewayIdRef.current, [gatewayId]: parsed.sessionKey }
-          : sessionKeyByGatewayIdRef.current,
-        parsed.sessionKey
-          ? { ...gatewayIdBySessionKeyRef.current, [parsed.sessionKey]: gatewayId }
-          : gatewayIdBySessionKeyRef.current,
-      );
-      if (!stillActive) return;
       const fallbackSnapshot: SessionSnapshot = {
         gateway_id: gatewayId,
         session_key: parsed.sessionKey || sessionKeyByGatewayIdRef.current[gatewayId] || "",
@@ -1113,11 +2213,42 @@ export function useHermesRpc(options: UseHermesRpcOptions = {}) {
         active_tools: [],
       };
       const transcript = await loadSessionTranscript(gatewayId, fallbackSnapshot);
+
+      if (switchingSessions) {
+        stashCurrentSessionTranscript();
+        stashCurrentSessionSubagents();
+      }
+      rememberGatewaySession(gatewayId);
+      setSessionId(gatewayId);
+      sessionIdRef.current = gatewayId;
+      setOverlay(EMPTY_OVERLAY);
+      loadSubagentsForSession(gatewayId);
+      setPromptQueue([]);
       applySessionSnapshot(gatewayId, fallbackSnapshot, { transcript });
       setStatus(`Opened live session ${parsed.sessionKey || gatewayId}`);
       rememberActiveSession(gatewayId, parsed.sessionKey || null);
       return;
     }
+
+    let transcript = await loadSessionTranscript(gatewayId, snapshot);
+    if (!switchingSessions) {
+      transcript = pickRicherTranscript(transcript, messagesRef.current);
+      transcript = enrichTranscriptWithReasoning(transcript, messagesRef.current);
+      transcript = mergeLiveActivityMessages(transcript, messagesRef.current);
+    }
+    transcript = coalesceAssistantReasoningTurns(transcript);
+    transcript = finalizeTranscriptHistory(transcript);
+
+    if (switchingSessions) {
+      stashCurrentSessionTranscript();
+      stashCurrentSessionSubagents();
+    }
+    rememberGatewaySession(gatewayId);
+    setSessionId(gatewayId);
+    sessionIdRef.current = gatewayId;
+    setOverlay(EMPTY_OVERLAY);
+    loadSubagentsForSession(gatewayId);
+    setPromptQueue([]);
 
     if (!eventMatchesActiveSession(
       gatewayId,
@@ -1131,6 +2262,7 @@ export function useHermesRpc(options: UseHermesRpcOptions = {}) {
     )) {
       return;
     }
+    applySessionSnapshot(gatewayId, snapshot, { transcript });
     setStatus(
       snapshot.running
         ? `Resumed live session · ${snapshot.activity || "Working…"}`
@@ -1138,15 +2270,19 @@ export function useHermesRpc(options: UseHermesRpcOptions = {}) {
     );
     rememberActiveSession(gatewayId, snapshot.session_key || null);
   }, [
-    applySessionSnapshot,
+    claimSessionTransport,
     linkSessionIds,
     loadSessionTranscript,
+    loadSubagentsForSession,
     markSessionIdle,
     markSessionRunning,
+    mergeLiveActivityMessages,
     rememberActiveSession,
     rememberGatewaySession,
     rpc,
-    syncSessionView,
+    stashCurrentSessionSubagents,
+    stashCurrentSessionTranscript,
+    url,
   ]);
 
   const coldResumeDbSession = useCallback(async (dbKey: string) => {
@@ -1157,6 +2293,8 @@ export function useHermesRpc(options: UseHermesRpcOptions = {}) {
       return existing;
     }
 
+    stashCurrentSessionTranscript();
+    stashCurrentSessionSubagents();
     setStatus("Resuming session…");
     const result: any = await rpc("session.resume", { session_id: dbKey, cols: 100 });
     const sid = result?.session_id ?? result?.result?.session_id;
@@ -1167,15 +2305,32 @@ export function useHermesRpc(options: UseHermesRpcOptions = {}) {
     sessionIdRef.current = sid;
     rememberGatewaySession(sid);
     setTools([]);
-    setSubagents([]);
+    loadSubagentsForSession(sid);
     setPromptQueue([]);
     setOverlay(EMPTY_OVERLAY);
     setBusy(false);
     streamingMessageId.current = null;
     const restored = Array.isArray(result?.messages) ? result.messages : [];
-    const resumedMessages = mapHistoryMessages(restored);
+    const recalled = recallSessionTranscript(
+      sid,
+      resumedKey,
+      sessionTranscriptsRef.current,
+      sessionKeyByGatewayIdRef.current,
+      gatewayIdBySessionKeyRef.current,
+    );
+    const resumedMessages = enrichTranscriptWithReasoning(
+      pickRicherTranscript(mapHistoryMessages(restored), recalled),
+      recalled,
+    );
     setMessages(resumedMessages);
-    persistSessionTranscript(sid, resumedKey, resumedMessages);
+    persistSessionTranscript(
+      sid,
+      resumedKey,
+      resumedMessages,
+      sessionTranscriptsRef.current,
+      sessionKeyByGatewayIdRef.current,
+      gatewayIdBySessionKeyRef.current,
+    );
     void syncGatewaySessionStatus(sid);
     setStatus(`Resumed ${resumedKey}`);
     rememberActiveSession(sid, resumedKey);
@@ -1225,6 +2380,7 @@ export function useHermesRpc(options: UseHermesRpcOptions = {}) {
         title: String(s.title ?? ""),
         preview: String(s.preview ?? ""),
         started_at: Number(s.started_at ?? 0),
+        last_response_at: Number(s.last_response_at ?? s.started_at ?? 0),
         message_count: Number(s.message_count ?? 0),
         source: String(s.source ?? ""),
       })).filter((s: SessionSummary) => s.id),
@@ -1260,6 +2416,16 @@ export function useHermesRpc(options: UseHermesRpcOptions = {}) {
     setSessions((prev) => prev.filter((session) => session.id !== dbKey));
     knownGatewayIdsRef.current.delete(target);
     if (gatewayId) knownGatewayIdsRef.current.delete(gatewayId);
+    guiTrackedSessionIdsRef.current.delete(target);
+    if (gatewayId) guiTrackedSessionIdsRef.current.delete(gatewayId);
+    guiTrackedSessionIdsRef.current.delete(dbKey);
+    setGuiTrackedSessionIds((prev) => {
+      const next = new Set(prev);
+      next.delete(target);
+      if (gatewayId) next.delete(gatewayId);
+      next.delete(dbKey);
+      return next;
+    });
     setSessionRuntime((prev) => {
       const next = { ...prev };
       delete next[target];
@@ -1282,22 +2448,84 @@ export function useHermesRpc(options: UseHermesRpcOptions = {}) {
     setStatus(`Deleted session ${dbKey.slice(0, 8)}`);
   }, [pollLiveSessions, rpc, url]);
 
-  const resumeSession = useCallback(async (target: string) => {
+  const resumeSession = useCallback(async (target: string, options?: { force?: boolean }) => {
     if (!target) return;
+    try {
+      const alreadyActive = matchesActiveSession(target);
 
-    const live = await discoverLiveSessions();
-    const liveGateway = findLiveGatewayForTarget(target, live);
-    if (liveGateway) {
-      await focusLiveSession(liveGateway);
-      return;
+      if (alreadyActive && !options?.force) return;
+
+      if (!alreadyActive) {
+        stashCurrentSessionTranscript();
+      }
+
+      const live = await discoverLiveSessions();
+      const liveGateway = findLiveGatewayForTarget(target, live);
+      if (liveGateway) {
+        await focusLiveSession(liveGateway);
+        return;
+      }
+
+      const runtime = resolveSessionRuntime(target);
+      if (runtime?.running || runtime?.blocked) {
+        const gatewayId = fleetTargetGatewayId(
+          target,
+          sessionKeyByGatewayIdRef.current,
+          gatewayIdBySessionKeyRef.current,
+        );
+        const liveMatch =
+          findLiveGatewayForTarget(gatewayId, live) ??
+          findLiveGatewayForTarget(target, live);
+        if (liveMatch) {
+          await focusLiveSession(liveMatch);
+          return;
+        }
+        if (knownGatewayIdsRef.current.has(gatewayId)) {
+          await focusLiveSession(gatewayId);
+          return;
+        }
+        throw new Error("That agent is still running but could not be focused. Try refreshing the session list.");
+      }
+
+      if (alreadyActive && options?.force) {
+        const gatewayId =
+          resolveLiveGatewayId(target) ??
+          fleetTargetGatewayId(
+            target,
+            sessionKeyByGatewayIdRef.current,
+            gatewayIdBySessionKeyRef.current,
+          );
+        if (gatewayId && (knownGatewayIdsRef.current.has(gatewayId) || sessionIdRef.current === gatewayId)) {
+          await claimSessionTransport(gatewayId);
+          await syncSessionView(gatewayId, { updateTranscript: true, mergeWithCurrent: true });
+          setStatus(`Reloaded ${trackedDbSessionId ?? target}`);
+          return;
+        }
+      }
+
+      const dbKey = sessions.some((session) => session.id === target)
+        ? target
+        : sessionKeyByGatewayIdRef.current[target] ?? target;
+
+      await coldResumeDbSession(dbKey);
+    } catch (error: any) {
+      setStatus(`Session switch failed: ${error?.message ?? "unknown error"}`);
+      throw error;
     }
-
-    const dbKey = sessions.some((session) => session.id === target)
-      ? target
-      : sessionKeyByGatewayIdRef.current[target] ?? target;
-
-    await coldResumeDbSession(dbKey);
-  }, [coldResumeDbSession, discoverLiveSessions, findLiveGatewayForTarget, focusLiveSession, sessions]);
+  }, [
+    claimSessionTransport,
+    coldResumeDbSession,
+    discoverLiveSessions,
+    findLiveGatewayForTarget,
+    focusLiveSession,
+    matchesActiveSession,
+    resolveLiveGatewayId,
+    resolveSessionRuntime,
+    sessions,
+    stashCurrentSessionTranscript,
+    syncSessionView,
+    trackedDbSessionId,
+  ]);
 
   useEffect(() => {
     refreshSessionsRef.current = refreshSessions;
@@ -1364,6 +2592,11 @@ export function useHermesRpc(options: UseHermesRpcOptions = {}) {
       setStatus("Connected; syncing sessions...");
       try {
         await attachInitialSession();
+        const gatewayId = sessionIdRef.current;
+        if (gatewayId) {
+          await claimSessionTransport(gatewayId);
+          void syncSessionView(gatewayId, { mergeWithCurrent: true });
+        }
       } catch (error: any) {
         setStatus(`Session attach failed: ${error.message}`);
       }
@@ -1416,7 +2649,7 @@ export function useHermesRpc(options: UseHermesRpcOptions = {}) {
       );
       setConnecting(false);
     };
-  }, [attachInitialSession, handleEvent, url]);
+  }, [attachInitialSession, claimSessionTransport, handleEvent, syncSessionView, url]);
 
   const syncSessionViewRef = useRef(syncSessionView);
   useEffect(() => {
@@ -1436,7 +2669,7 @@ export function useHermesRpc(options: UseHermesRpcOptions = {}) {
         (dbKey ? sessionRuntime[dbKey] : undefined);
       if (!runtime?.running && !busy) return;
       void syncSessionViewRef.current(gatewayId, {
-        updateTranscript: !streamingMessageId.current,
+        updateTranscript: true,
         mergeWithCurrent: true,
       });
     }, 2000);
@@ -1461,7 +2694,14 @@ export function useHermesRpc(options: UseHermesRpcOptions = {}) {
     setOverlay(EMPTY_OVERLAY);
     setTools((prev) => prev.map((t) => ({ ...t, status: "complete" as const })));
     setSubagents([]);
+    if (sessionIdRef.current) {
+      clearSessionSubagents(sessionIdRef.current);
+    }
     setPromptQueue([]);
+  }, [clearSessionSubagents]);
+
+  const hintInterruptArmed = useCallback(() => {
+    setStatus("Press Enter again to stop");
   }, []);
 
   const interruptSession = useCallback(async () => {
@@ -1479,15 +2719,18 @@ export function useHermesRpc(options: UseHermesRpcOptions = {}) {
   }, [finalizeInterruptedTurn, rpc]);
 
   const createSession = useCallback(async () => {
+    stashCurrentSessionTranscript();
     const result: any = await rpc("session.create", { cols: 100 });
     const sid = result?.session_id ?? result?.result?.session_id;
     if (!sid) throw new Error("session.create returned no session_id");
     setSessionId(sid);
     sessionIdRef.current = sid;
     rememberGatewaySession(sid);
+    trackGuiSession(sid);
     setMessages([]);
     setTools([]);
     setSubagents([]);
+    clearSessionSubagents(sid);
     setPromptQueue([]);
     setOverlay(EMPTY_OVERLAY);
     setBusy(false);
@@ -1496,9 +2739,32 @@ export function useHermesRpc(options: UseHermesRpcOptions = {}) {
     rememberActiveSession(sid, null);
     setStatus("New session ready");
     return sid;
-  }, [rememberActiveSession, rememberGatewaySession, rpc, syncGatewaySessionStatus]);
+  }, [clearSessionSubagents, rememberActiveSession, rememberGatewaySession, rpc, stashCurrentSessionTranscript, syncGatewaySessionStatus, trackGuiSession]);
 
-  const appendOptimisticUserMessage = useCallback((text: string) => {
+  const appendOptimisticUserMessage = useCallback((text: string, id?: string) => {
+    const gatewaySessionId = resolveGatewaySessionId(
+      sessionIdRef.current,
+      sessionKeyByGatewayIdRef.current,
+      gatewayIdBySessionKeyRef.current,
+      knownGatewayIdsRef.current,
+    );
+    if (!gatewaySessionId) return null;
+    const dbKey = sessionKeyByGatewayIdRef.current[gatewaySessionId];
+    const { message, messages: next } = appendLocalUserTurn(messagesRef.current, text, { id });
+    messagesRef.current = next;
+    setMessages(next);
+    persistSessionTranscript(
+      gatewaySessionId,
+      dbKey,
+      next,
+      sessionTranscriptsRef.current,
+      sessionKeyByGatewayIdRef.current,
+      gatewayIdBySessionKeyRef.current,
+    );
+    return message.id;
+  }, []);
+
+  const removeOptimisticUserMessage = useCallback((messageId: string) => {
     const gatewaySessionId = resolveGatewaySessionId(
       sessionIdRef.current,
       sessionKeyByGatewayIdRef.current,
@@ -1506,16 +2772,42 @@ export function useHermesRpc(options: UseHermesRpcOptions = {}) {
       knownGatewayIdsRef.current,
     );
     if (!gatewaySessionId) return;
-    setMessages((prev) => {
-      const next = [
-        ...prev,
-        { id: `user-${Date.now()}`, role: "user" as const, text, createdAt: Date.now() },
-      ];
-      saveCachedTranscript(gatewaySessionId, next);
-      const dbKey = sessionKeyByGatewayIdRef.current[gatewaySessionId];
-      if (dbKey) saveCachedTranscript(dbKey, next);
-      return next;
-    });
+    const dbKey = sessionKeyByGatewayIdRef.current[gatewaySessionId];
+    const next = removeTranscriptMessage(messagesRef.current, messageId);
+    messagesRef.current = next;
+    setMessages(next);
+    persistSessionTranscript(
+      gatewaySessionId,
+      dbKey,
+      next,
+      sessionTranscriptsRef.current,
+      sessionKeyByGatewayIdRef.current,
+      gatewayIdBySessionKeyRef.current,
+    );
+  }, []);
+
+  const appendSlashCommandMessage = useCallback((command: string, id?: string) => {
+    const gatewaySessionId = resolveGatewaySessionId(
+      sessionIdRef.current,
+      sessionKeyByGatewayIdRef.current,
+      gatewayIdBySessionKeyRef.current,
+      knownGatewayIdsRef.current,
+    );
+    if (!gatewaySessionId) return null;
+    const dbKey = sessionKeyByGatewayIdRef.current[gatewaySessionId];
+    const next = appendSlashCommandTurn(messagesRef.current, command, { id });
+    if (next === messagesRef.current) return null;
+    messagesRef.current = next;
+    setMessages(next);
+    persistSessionTranscript(
+      gatewaySessionId,
+      dbKey,
+      next,
+      sessionTranscriptsRef.current,
+      sessionKeyByGatewayIdRef.current,
+      gatewayIdBySessionKeyRef.current,
+    );
+    return next[next.length - 1]?.id ?? null;
   }, []);
 
   const removeQueuedPrompt = useCallback((text: string) => {
@@ -1530,12 +2822,24 @@ export function useHermesRpc(options: UseHermesRpcOptions = {}) {
     setPromptQueue((prev) => prev.filter((_, itemIndex) => itemIndex !== index));
   }, []);
 
-  const queuePrompt = useCallback((text: string) => {
+  const queuePrompt = useCallback((text: string, options: { optimistic?: boolean } = {}) => {
     const trimmed = text.trim();
     if (!trimmed) return;
+    if (options.optimistic !== false && !transcriptHasPendingUserTurn(messagesRef.current, trimmed)) {
+      appendOptimisticUserMessage(trimmed);
+    }
     setPromptQueue((prev) => [...prev, trimmed]);
-    setStatus(`Queued · Enter twice to send now`);
-  }, []);
+    appendAgentAction(describeQueuedPrompt(trimmed));
+    setStatus("Follow-up queued · it will send when Hermes is ready");
+  }, [appendAgentAction, appendOptimisticUserMessage]);
+
+  useEffect(() => {
+    for (const queued of promptQueue) {
+      if (!transcriptHasPendingUserTurn(messagesRef.current, queued)) {
+        appendOptimisticUserMessage(queued);
+      }
+    }
+  }, [appendOptimisticUserMessage, promptQueue]);
 
   const steerPrompt = useCallback(async (text: string) => {
     const gatewaySessionId = resolveGatewaySessionId(
@@ -1549,7 +2853,9 @@ export function useHermesRpc(options: UseHermesRpcOptions = {}) {
     if (!trimmed) return;
 
     removeQueuedPrompt(trimmed);
-    appendOptimisticUserMessage(trimmed);
+    if (!transcriptHasPendingUserTurn(messagesRef.current, trimmed)) {
+      appendOptimisticUserMessage(trimmed);
+    }
 
     try {
       const result: any = await rpc("session.steer", {
@@ -1557,17 +2863,17 @@ export function useHermesRpc(options: UseHermesRpcOptions = {}) {
         text: trimmed,
       });
       if (result?.status !== "queued") {
-        setPromptQueue((prev) => [...prev, trimmed]);
+        queuePrompt(trimmed, { optimistic: false });
         setStatus("Steer rejected — queued for next turn");
         return;
       }
       setStatus("Follow-up added to current turn");
     } catch (error: any) {
-      setPromptQueue((prev) => [...prev, trimmed]);
+      queuePrompt(trimmed, { optimistic: false });
       setStatus(`Steer failed — queued for next turn`);
       throw error;
     }
-  }, [appendOptimisticUserMessage, removeQueuedPrompt, rpc]);
+  }, [appendOptimisticUserMessage, queuePrompt, removeQueuedPrompt, rpc]);
 
   const steerNextQueuedPrompt = useCallback(async () => {
     const next = promptQueueRef.current[0];
@@ -1576,7 +2882,7 @@ export function useHermesRpc(options: UseHermesRpcOptions = {}) {
     return true;
   }, [steerPrompt]);
 
-  const sendPrompt = useCallback(async (text: string) => {
+  const sendPrompt = useCallback(async (text: string, options: { optimistic?: boolean } = {}) => {
     const gatewaySessionId = resolveGatewaySessionId(
       sessionIdRef.current,
       sessionKeyByGatewayIdRef.current,
@@ -1586,56 +2892,118 @@ export function useHermesRpc(options: UseHermesRpcOptions = {}) {
     if (!gatewaySessionId) throw new Error("No session yet");
     const trimmed = text.trim();
     if (!trimmed) return;
-    const optimisticId = `user-${Date.now()}`;
-    setMessages((prev) => {
-      const next = [
-        ...prev,
-        { id: optimisticId, role: "user" as const, text: trimmed, createdAt: Date.now() },
-      ];
-      saveCachedTranscript(gatewaySessionId, next);
-      const dbKey = sessionKeyByGatewayIdRef.current[gatewaySessionId];
-      if (dbKey) saveCachedTranscript(dbKey, next);
-      return next;
-    });
+    const dbKey = sessionKeyByGatewayIdRef.current[gatewaySessionId];
+    rememberSessionPurpose(trimmed, [gatewaySessionId, dbKey]);
+    setSubagents([]);
+    clearSessionSubagents(gatewaySessionId);
+    const optimisticId =
+      options.optimistic === false
+        ? null
+        : appendOptimisticUserMessage(trimmed, `user-${Date.now()}`);
     try {
       await rpc("prompt.submit", { session_id: gatewaySessionId, text: trimmed });
       setBusy(true);
     } catch (error: any) {
-      setMessages((prev) => prev.filter((message) => message.id !== optimisticId));
       if (isSessionBusyError(error)) {
-        setPromptQueue((prev) => [...prev, trimmed]);
-        setStatus("Queued · Enter twice to send now");
+        queuePrompt(trimmed, { optimistic: false });
+        setStatus("Follow-up queued · it will send when Hermes is ready");
         return;
+      }
+      if (optimisticId) {
+        removeOptimisticUserMessage(optimisticId);
       }
       setStatus(`Send failed: ${error.message ?? "unknown error"}`);
       throw error;
     }
-  }, [rpc]);
+  }, [
+    appendOptimisticUserMessage,
+    clearSessionSubagents,
+    queuePrompt,
+    rememberSessionPurpose,
+    removeOptimisticUserMessage,
+    rpc,
+  ]);
 
   const drainPromptQueue = useCallback(async () => {
-    if (drainingQueueRef.current || busy || isBlocked) return;
+    if (drainingQueueRef.current || activeSessionBusy || isBlocked) return;
     const next = promptQueueRef.current[0];
     if (!next) return;
     drainingQueueRef.current = true;
     setPromptQueue((prev) => prev.slice(1));
     try {
-      await sendPrompt(next);
+      await sendPrompt(next, { optimistic: false });
     } catch {
       setPromptQueue((prev) => [next, ...prev]);
     } finally {
       drainingQueueRef.current = false;
     }
-  }, [busy, isBlocked, sendPrompt]);
+  }, [activeSessionBusy, isBlocked, sendPrompt]);
 
   useEffect(() => {
-    if (busy || isBlocked || promptQueue.length === 0) return;
+    if (activeSessionBusy || isBlocked || promptQueue.length === 0) return;
     void drainPromptQueue();
-  }, [busy, drainPromptQueue, isBlocked, promptQueue.length]);
+  }, [activeSessionBusy, drainPromptQueue, isBlocked, promptQueue.length]);
 
-  const executeSlashCommand = useCallback(async (input: string) => {
-    const trimmed = input.trim();
+  const executeSlashCommand = useCallback(async (
+    input: string,
+    options: { recordCommand?: boolean } = {},
+  ) => {
+    const rawTrimmed = input.trim();
+    const trimmed = rawTrimmed.toLowerCase().startsWith("terminal ")
+      ? "/" + rawTrimmed
+      : rawTrimmed;
     if (!trimmed.startsWith("/")) {
-      await sendPrompt(trimmed);
+      await sendPrompt(rawTrimmed);
+      return;
+    }
+
+    const body = trimmed.slice(1);
+    const [namePart = "", ...rest] = body.split(/\s+/);
+    const name = namePart.trim();
+    const arg = body.slice(name.length).trimStart();
+    if (!name) return;
+    if (options.recordCommand !== false) {
+      appendSlashCommandMessage(trimmed, `slash-${Date.now()}`);
+    }
+
+    if (name === "terminal") {
+      setStatus("Running /terminal…");
+      appendAgentAction({
+        kind: "tool",
+        title: "Running local command",
+        detail: arg || "(empty command)",
+        status: "running",
+      });
+      try {
+        const terminalResult: any = await rpc("terminal.run", { command: arg });
+        const commandText = String(terminalResult?.command ?? arg);
+        const output = String(terminalResult?.output ?? "(no output)");
+        const exitCode = terminalResult?.exit_code ?? "unknown";
+        const duration = Number(terminalResult?.duration_seconds);
+        const durationText = Number.isFinite(duration) ? duration.toFixed(2) + "s" : "unknown duration";
+        appendAgentAction({
+          kind: terminalResult?.timed_out ? "error" : "system",
+          title: terminalResult?.timed_out ? "Terminal command timed out" : "Terminal command complete",
+          detail: [
+            "$ " + commandText,
+            "",
+            output,
+            "",
+            "Exit code: " + exitCode + " · Duration: " + durationText,
+          ].join("\n"),
+          status: terminalResult?.timed_out ? "error" : "complete",
+        });
+        setStatus("/terminal complete");
+      } catch (error: any) {
+        appendAgentAction({
+          kind: "error",
+          title: "/terminal failed",
+          detail: error.message ?? "unknown error",
+          status: "error",
+        });
+        setStatus("/terminal failed");
+        throw error;
+      }
       return;
     }
 
@@ -1647,33 +3015,56 @@ export function useHermesRpc(options: UseHermesRpcOptions = {}) {
     );
     if (!gatewaySessionId) throw new Error("No session yet");
 
-    const body = trimmed.slice(1);
-    const [namePart = "", ...rest] = body.split(/\s+/);
-    const name = namePart.trim();
-    const arg = body.slice(name.length).trimStart();
-    if (!name) return;
-
     const renderOutput = (value: any) => {
       const output = String(value?.output ?? value?.status ?? value?.message ?? "");
-      if (value?.warning) appendSystemMessage(String(value.warning));
-      if (output && output !== "(no output)") appendSystemMessage(output);
+      if (value?.warning) {
+        appendAgentAction({
+          kind: "system",
+          title: "Warning",
+          detail: String(value.warning),
+          status: "running",
+        });
+      }
+      if (output && output !== "(no output)") {
+        appendAgentAction({
+          kind: "system",
+          title: "Command output",
+          detail: output,
+          status: "complete",
+        });
+      }
     };
 
     const handleDispatchResult = async (result: any): Promise<boolean> => {
       if (!result || typeof result !== "object") return false;
       if (result.type === "send") {
-        if (result.notice) appendSystemMessage(String(result.notice));
-        await sendPrompt(String(result.message ?? ""));
+        if (result.notice) {
+          appendAgentAction({
+            kind: "system",
+            title: "Notice",
+            detail: String(result.notice),
+            status: "running",
+          });
+        }
+        await sendPrompt(String(result.message ?? ""), { optimistic: false });
         return true;
       }
       if (result.type === "skill") {
-        appendSystemMessage(`Loaded /${name} skill context.`);
-        await sendPrompt(String(result.message ?? ""));
+        appendAgentAction({
+          kind: "system",
+          title: "Skill loaded",
+          detail: `Loaded /${name} skill context.`,
+          status: "complete",
+        });
+        await sendPrompt(String(result.message ?? ""), { optimistic: false });
         return true;
       }
       if (result.type === "alias" && result.target) {
         const target = String(result.target).trim();
-        await executeSlashCommand(target.startsWith("/") ? `${target}${arg ? ` ${arg}` : ""}` : `/${target}${arg ? ` ${arg}` : ""}`);
+        await executeSlashCommand(
+          target.startsWith("/") ? `${target}${arg ? ` ${arg}` : ""}` : `/${target}${arg ? ` ${arg}` : ""}`,
+          { recordCommand: false },
+        );
         return true;
       }
       if (result.type === "exec" || result.type === "plugin") {
@@ -1697,7 +3088,12 @@ export function useHermesRpc(options: UseHermesRpcOptions = {}) {
     } catch (dispatchError: any) {
       const message = String(dispatchError?.message ?? "");
       if (!message.includes("not a quick/plugin/skill command") && !message.includes("4018")) {
-        appendSystemMessage(`/${name}: ${message}`, "error");
+        appendAgentAction({
+          kind: "error",
+          title: `/${name}`,
+          detail: message,
+          status: "error",
+        });
         setStatus(`/${name} failed`);
         throw dispatchError;
       }
@@ -1711,11 +3107,16 @@ export function useHermesRpc(options: UseHermesRpcOptions = {}) {
       renderOutput(slashResult);
       setStatus(`/${name} complete`);
     } catch (error: any) {
-      appendSystemMessage(`/${name}: ${error.message ?? "unknown error"}`, "error");
+      appendAgentAction({
+        kind: "error",
+        title: `/${name}`,
+        detail: error.message ?? "unknown error",
+        status: "error",
+      });
       setStatus(`/${name} failed`);
       throw error;
     }
-  }, [appendSystemMessage, rpc, sendPrompt]);
+  }, [appendAgentAction, appendSlashCommandMessage, appendSystemMessage, rpc, sendPrompt]);
 
   const getSlashCompletions = useCallback(async (text: string): Promise<SlashCompletionResult> => {
     const result: any = await rpc("complete.slash", { text });
@@ -1726,7 +3127,16 @@ export function useHermesRpc(options: UseHermesRpcOptions = {}) {
           meta: item.meta == null ? undefined : String(item.meta),
         })).filter((item: any) => item.text)
       : [];
-    return { items, replace_from: Number.isFinite(result?.replace_from) ? Number(result.replace_from) : undefined };
+    const query = text.trimStart();
+    const queryName = query.replace(/^\//, "");
+    const shouldOfferTerminal =
+      !queryName ||
+      "/terminal".startsWith(query) ||
+      "terminal".startsWith(queryName);
+    const completionItems = shouldOfferTerminal && !items.some((item: any) => item.text === "/terminal" || item.text === "terminal")
+      ? [{ text: "/terminal", display: "/terminal", meta: "run a local shell command" }, ...items]
+      : items;
+    return { items: completionItems, replace_from: Number.isFinite(result?.replace_from) ? Number(result.replace_from) : undefined };
   }, [rpc]);
 
   const request = useCallback(
@@ -1771,11 +3181,223 @@ export function useHermesRpc(options: UseHermesRpcOptions = {}) {
     () => delegationIsActive(subagents, busy),
     [subagents, busy],
   );
+  const currentMissionSummary = useMemo(() => {
+    const activeId = sessionId ?? activeDbSessionId;
+    if (!activeId) return null;
+    if (subagents.length > 0) {
+      const title = sessions.find((session) => session.id === activeDbSessionId || session.id === sessionId)?.title ?? activeId;
+      const completedAt = subagents.reduce((latest, item) => {
+        const finishedAt = item.startedAt != null && item.durationSeconds != null
+          ? item.startedAt + item.durationSeconds * 1000
+          : item.startedAt ?? latest;
+        return Math.max(latest, finishedAt);
+      }, 0) || Date.now();
+      return createMissionSummary(activeId, title, subagents, completedAt);
+    }
+    return missionSummaries[activeId] ?? (activeDbSessionId ? missionSummaries[activeDbSessionId] : null) ?? null;
+  }, [activeDbSessionId, missionSummaries, sessionId, sessions, subagents]);
+
+  useEffect(() => {
+    if (!currentMissionSummary || currentMissionSummary.status === "running") return;
+    setMissionSummaries((prev) => {
+      const existing = prev[currentMissionSummary.sessionId];
+      if (
+        existing?.status === currentMissionSummary.status &&
+        existing?.completedAt === currentMissionSummary.completedAt &&
+        existing?.summaryText === currentMissionSummary.summaryText &&
+        existing?.agentCount === currentMissionSummary.agentCount &&
+        existing?.toolCount === currentMissionSummary.toolCount &&
+        existing?.filesTouched === currentMissionSummary.filesTouched
+      ) {
+        return prev;
+      }
+      const next = upsertMissionSummary(prev, currentMissionSummary, [sessionId, activeDbSessionId]);
+      saveMissionSummaries(next);
+      return next;
+    });
+  }, [activeDbSessionId, currentMissionSummary, sessionId]);
 
   const liveAssistantTurn = useMemo(
     () => messages.find((message) => message.role === "assistant" && message.status === "streaming") ?? null,
     [messages],
   );
+
+  const delegatingSessionIds = useMemo(() => {
+    const ids = new Set<string>();
+    for (const [sessionKey, items] of Object.entries(subagentsBySessionId)) {
+      if (delegationIsActive(items, false)) ids.add(sessionKey);
+    }
+    if (delegationActive && sessionId) {
+      ids.add(sessionId);
+      const dbKey = sessionKeyByGatewayId[sessionId];
+      if (dbKey) ids.add(dbKey);
+    }
+    return ids;
+  }, [delegationActive, sessionId, sessionKeyByGatewayId, subagentsBySessionId]);
+
+  const fleetTranscriptsById = useMemo(() => {
+    const map: Record<string, ChatMessage[]> = { ...sessionTranscriptsRef.current };
+    if (sessionId && messages.length) {
+      map[sessionId] = messages;
+      const dbKey = sessionKeyByGatewayId[sessionId];
+      if (dbKey) map[dbKey] = messages;
+    }
+
+    const ids = new Set<string>([
+      ...runningSessionIds,
+      ...guiTrackedSessionIds,
+      ...Object.keys(sessionKeyByGatewayId),
+    ]);
+    for (const id of ids) {
+      if (map[id]?.length) continue;
+      const cached = loadCachedTranscript(id);
+      if (cached.length) map[id] = cached;
+    }
+    for (const [gatewayId, dbKey] of Object.entries(sessionKeyByGatewayId)) {
+      if (map[gatewayId]?.length || map[dbKey]?.length) continue;
+      const cached = loadCachedTranscript(dbKey);
+      if (cached.length) {
+        map[dbKey] = cached;
+        map[gatewayId] = cached;
+      }
+    }
+    return map;
+  }, [guiTrackedSessionIds, messages, runningSessionIds, sessionId, sessionKeyByGatewayId]);
+
+  const fleetSnapshot = useMemo((): FleetSnapshot => buildFleetSnapshot({
+    sessionRuntime,
+    sessions: [...sessions, ...unsavedLiveSessions],
+    missionSummaries,
+    attentionRequests,
+    sessionKeyByGatewayId,
+    gatewayIdBySessionKey,
+    activeSessionId: sessionId,
+    activeDbSessionId,
+    delegatingSessionIds,
+    subagentsBySessionId,
+    guiTrackedSessionIds: guiTrackedSessionIds,
+    sessionPurposeTitles,
+    sessionTranscriptsById: fleetTranscriptsById,
+  }), [
+    activeDbSessionId,
+    attentionRequests,
+    delegatingSessionIds,
+    fleetTranscriptsById,
+    gatewayIdBySessionKey,
+    guiTrackedSessionIds,
+    missionSummaries,
+    sessionId,
+    sessionKeyByGatewayId,
+    sessionPurposeTitles,
+    sessionRuntime,
+    sessions,
+    subagentsBySessionId,
+    unsavedLiveSessions,
+  ]);
+
+  const resolveTargetGatewayId = useCallback((targetSessionId: string) => {
+    return fleetTargetGatewayId(
+      targetSessionId,
+      sessionKeyByGatewayIdRef.current,
+      gatewayIdBySessionKeyRef.current,
+    );
+  }, []);
+
+  const targetMatchesActiveSession = useCallback((targetSessionId: string) => {
+    const gatewayId = resolveTargetGatewayId(targetSessionId);
+    const activeGateway = sessionIdRef.current;
+    if (!activeGateway) return false;
+    return (
+      gatewayId === activeGateway ||
+      sessionKeyByGatewayIdRef.current[gatewayId] === activeDbSessionId ||
+      sessionKeyByGatewayIdRef.current[activeGateway] === targetSessionId ||
+      gatewayIdBySessionKeyRef.current[targetSessionId] === activeGateway
+    );
+  }, [activeDbSessionId, resolveTargetGatewayId]);
+
+  const spawnAgentWithGoal = useCallback(async (text: string) => {
+    const trimmed = text.trim();
+    if (!trimmed) throw new Error("Goal text required");
+
+    const result: any = await rpc("session.create", { cols: 100 });
+    const sid = result?.session_id ?? result?.result?.session_id;
+    if (!sid) throw new Error("session.create returned no session_id");
+
+    rememberGatewaySession(sid);
+    trackGuiSession(sid);
+    rememberSessionPurpose(trimmed, [sid], { force: true });
+    try {
+      await rpc("prompt.submit", { session_id: sid, text: trimmed });
+      markSessionRunning(sid, trimmed.slice(0, 72) || "Working…");
+      setStatus(`Spawned agent ${sid.slice(0, 8)}`);
+      scheduleSessionTitleSync(sid, 3000);
+      void refreshSessionsRef.current();
+      return sid;
+    } catch (error: any) {
+      setStatus(`Spawn failed: ${error.message ?? "unknown error"}`);
+      throw error;
+    }
+  }, [markSessionRunning, rememberGatewaySession, rememberSessionPurpose, rpc, scheduleSessionTitleSync, trackGuiSession]);
+
+  const sendPromptToSession = useCallback(async (targetSessionId: string, text: string) => {
+    const trimmed = text.trim();
+    if (!trimmed) return;
+    if (targetSessionId === FLEET_NEW_AGENT_TARGET) {
+      await spawnAgentWithGoal(trimmed);
+      return;
+    }
+    if (targetMatchesActiveSession(targetSessionId)) {
+      await sendPrompt(trimmed);
+      return;
+    }
+
+    const gatewaySessionId = resolveTargetGatewayId(targetSessionId);
+    if (!gatewaySessionId) throw new Error("Unknown target session");
+    rememberGatewaySession(gatewaySessionId);
+    trackGuiSession(
+      gatewaySessionId,
+      sessionKeyByGatewayIdRef.current[gatewaySessionId],
+      gatewayIdBySessionKeyRef.current[gatewaySessionId],
+    );
+    const dbKey = sessionKeyByGatewayIdRef.current[gatewaySessionId];
+    rememberSessionPurpose(trimmed, [gatewaySessionId, dbKey]);
+    try {
+      await rpc("prompt.submit", { session_id: gatewaySessionId, text: trimmed });
+      markSessionRunning(gatewaySessionId, "Working…");
+      setStatus(`Prompt sent to ${gatewaySessionId.slice(0, 8)}`);
+    } catch (error: any) {
+      if (isSessionBusyError(error)) {
+        setStatus(`Session ${gatewaySessionId.slice(0, 8)} is busy — open chat to steer or queue`);
+        throw error;
+      }
+      setStatus(`Send failed: ${error.message ?? "unknown error"}`);
+      throw error;
+    }
+  }, [markSessionRunning, rememberGatewaySession, rememberSessionPurpose, resolveTargetGatewayId, rpc, sendPrompt, spawnAgentWithGoal, targetMatchesActiveSession, trackGuiSession]);
+
+  const interruptSessionById = useCallback(async (targetSessionId: string) => {
+    const gatewaySessionId = resolveTargetGatewayId(targetSessionId);
+    if (!gatewaySessionId) throw new Error("Unknown target session");
+
+    setStatus("Stopping…");
+    if (targetMatchesActiveSession(targetSessionId)) {
+      finalizeInterruptedTurn();
+    }
+
+    try {
+      await rpc("session.interrupt", { session_id: gatewaySessionId });
+      markSessionIdle(gatewaySessionId, "Stopped");
+      setStatus(`Stopped session ${gatewaySessionId.slice(0, 8)} · Ready`);
+    } catch (error: any) {
+      setStatus(`Interrupt failed: ${error.message ?? "unknown error"}`);
+      throw error;
+    }
+  }, [finalizeInterruptedTurn, markSessionIdle, resolveTargetGatewayId, rpc, targetMatchesActiveSession]);
+
+  const focusSession = useCallback(async (targetSessionId: string, options?: { force?: boolean }) => {
+    if (!targetSessionId) return;
+    await resumeSession(targetSessionId, options);
+  }, [resumeSession]);
 
   return useMemo(() => ({
     url,
@@ -1786,6 +3408,10 @@ export function useHermesRpc(options: UseHermesRpcOptions = {}) {
     messages,
     tools,
     subagents,
+    attentionRequests,
+    openAttentionRequest,
+    missionSummaries,
+    currentMissionSummary,
     subagentTree,
     delegationActive,
     liveAssistantTurn,
@@ -1793,8 +3419,10 @@ export function useHermesRpc(options: UseHermesRpcOptions = {}) {
     queuePrompt,
     steerPrompt,
     steerNextQueuedPrompt,
+    hintInterruptArmed,
     removeQueuedPromptAt,
     sessions,
+    liveResponseAt: sessionLastResponseAt,
     unsavedLiveSessions,
     sessionRuntime,
     sessionKeyByGatewayId,
@@ -1807,6 +3435,7 @@ export function useHermesRpc(options: UseHermesRpcOptions = {}) {
     canSwitchToSession,
     status,
     busy,
+    activeSessionBusy,
     overlay,
     isBlocked,
     connect,
@@ -1832,6 +3461,11 @@ export function useHermesRpc(options: UseHermesRpcOptions = {}) {
     listToolsets,
     configureToolsets,
     toggleVoice,
+    fleetSnapshot,
+    sendPromptToSession,
+    spawnAgentWithGoal,
+    interruptSessionById,
+    focusSession,
   }), [
     url,
     connected,
@@ -1840,6 +3474,10 @@ export function useHermesRpc(options: UseHermesRpcOptions = {}) {
     messages,
     tools,
     subagents,
+    attentionRequests,
+    openAttentionRequest,
+    missionSummaries,
+    currentMissionSummary,
     subagentTree,
     delegationActive,
     liveAssistantTurn,
@@ -1847,8 +3485,10 @@ export function useHermesRpc(options: UseHermesRpcOptions = {}) {
     queuePrompt,
     steerPrompt,
     steerNextQueuedPrompt,
+    hintInterruptArmed,
     removeQueuedPromptAt,
     sessions,
+    sessionLastResponseAt,
     unsavedLiveSessions,
     sessionRuntime,
     sessionKeyByGatewayId,
@@ -1861,6 +3501,7 @@ export function useHermesRpc(options: UseHermesRpcOptions = {}) {
     canSwitchToSession,
     status,
     busy,
+    activeSessionBusy,
     overlay,
     isBlocked,
     connect,
@@ -1886,5 +3527,10 @@ export function useHermesRpc(options: UseHermesRpcOptions = {}) {
     listToolsets,
     configureToolsets,
     toggleVoice,
+    fleetSnapshot,
+    sendPromptToSession,
+    spawnAgentWithGoal,
+    interruptSessionById,
+    focusSession,
   ]);
 }
