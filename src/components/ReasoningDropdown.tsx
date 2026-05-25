@@ -85,10 +85,10 @@ export function ReasoningDropdown({
   const hasReasoning = Boolean(reasoning?.trim());
 
   useEffect(() => {
-    if (autoOpenOnReasoning && streaming && hasReasoning) {
+    if (autoOpenOnReasoning && streaming) {
       setOpen(true);
     }
-  }, [autoOpenOnReasoning, hasReasoning, streaming]);
+  }, [autoOpenOnReasoning, streaming]);
 
   if (!streaming && !hasReasoning) return null;
 

@@ -28,6 +28,7 @@ import {
 import {
   loadCachedTranscript,
   mergeTranscriptMessages,
+  pickRicherTranscript,
   saveCachedTranscript,
 } from "./chatTranscriptStorage";
 import { summarizeUnknownRequest } from "./requestPayloadSanitizer";
@@ -122,25 +123,45 @@ function mapSnapshotTools(snapshot: SessionSnapshot): ToolActivity[] {
   }));
 }
 
-function transcriptNeedsInProgressBubble(messages: ChatMessage[]): boolean {
-  if (messages.length === 0) return false;
-  const last = messages[messages.length - 1];
-  if (last.status === "streaming") return false;
-  return last.role === "user" || last.role === "system";
+function findStreamingAssistantId(messages: ChatMessage[]): string | null {
+  return messages.find((message) => message.role === "assistant" && message.status === "streaming")?.id ?? null;
+}
+
+function appendStreamingAssistantBubble(
+  messages: ChatMessage[],
+  idPrefix = "assistant",
+): { messages: ChatMessage[]; id: string } {
+  const existing = findStreamingAssistantId(messages);
+  if (existing) return { messages, id: existing };
+  const id = `${idPrefix}-${Date.now()}`;
+  return {
+    id,
+    messages: [
+      ...messages,
+      {
+        id,
+        role: "assistant",
+        text: "",
+        status: "streaming",
+        createdAt: Date.now(),
+      },
+    ],
+  };
+}
+
+function persistSessionTranscript(
+  gatewayId: string | null,
+  dbKey: string | undefined,
+  messages: ChatMessage[],
+) {
+  const stable = messages.filter((message) => message.status !== "streaming");
+  if (!gatewayId || stable.length === 0) return;
+  saveCachedTranscript(gatewayId, stable);
+  if (dbKey) saveCachedTranscript(dbKey, stable);
 }
 
 function appendInProgressBubble(messages: ChatMessage[]): ChatMessage[] {
-  if (!transcriptNeedsInProgressBubble(messages)) return messages;
-  return [
-    ...messages,
-    {
-      id: `assistant-resume-${Date.now()}`,
-      role: "assistant",
-      text: "",
-      status: "streaming",
-      createdAt: Date.now(),
-    },
-  ];
+  return appendStreamingAssistantBubble(messages, "assistant-resume").messages;
 }
 
 export function useHermesRpc(options: UseHermesRpcOptions = {}) {
@@ -171,6 +192,7 @@ export function useHermesRpc(options: UseHermesRpcOptions = {}) {
   const nextId = useRef(1);
   const pending = useRef<Map<number, Pending>>(new Map());
   const streamingMessageId = useRef<string | null>(null);
+  const messagesRef = useRef<ChatMessage[]>([]);
   const autoResumeOnConnectRef = useRef(options.autoResumeOnConnect ?? false);
   const sessionIdRef = useRef<string | null>(null);
   const knownGatewayIdsRef = useRef<Set<string>>(
@@ -262,6 +284,10 @@ export function useHermesRpc(options: UseHermesRpcOptions = {}) {
   useEffect(() => {
     sessionIdRef.current = sessionId;
   }, [sessionId]);
+
+  useEffect(() => {
+    messagesRef.current = messages;
+  }, [messages]);
 
   useEffect(() => {
     let cancelled = false;
@@ -575,12 +601,11 @@ export function useHermesRpc(options: UseHermesRpcOptions = {}) {
       case "message.start": {
         setBusy(true);
         setSubagents([]);
-        const id = `assistant-${Date.now()}`;
-        streamingMessageId.current = id;
-        setMessages((prev) => [
-          ...prev,
-          { id, role: "assistant", text: "", status: "streaming", createdAt: Date.now() },
-        ]);
+        setMessages((prev) => {
+          const { messages, id } = appendStreamingAssistantBubble(prev);
+          streamingMessageId.current = id;
+          return messages;
+        });
         break;
       }
       case "message.delta": {
@@ -596,13 +621,14 @@ export function useHermesRpc(options: UseHermesRpcOptions = {}) {
       case "reasoning.delta": {
         const snippet = String(data.text ?? "");
         if (!snippet) break;
+        setBusy(true);
         setMessages((prev) => {
-          const id =
-            streamingMessageId.current ??
-            [...prev].reverse().find((m) => m.role === "assistant" && m.status === "streaming")?.id;
-          if (!id) return prev;
-          return prev.map((m) =>
-            m.id === id ? { ...m, reasoning: `${m.reasoning ?? ""}${snippet}` } : m,
+          const { messages: withBubble, id } = appendStreamingAssistantBubble(prev);
+          streamingMessageId.current = id;
+          return withBubble.map((message) =>
+            message.id === id
+              ? { ...message, reasoning: `${message.reasoning ?? ""}${snippet}` }
+              : message,
           );
         });
         break;
@@ -610,13 +636,19 @@ export function useHermesRpc(options: UseHermesRpcOptions = {}) {
       case "reasoning.available": {
         const snippet = String(data.text ?? "").trim();
         if (!snippet) break;
+        setBusy(true);
         setMessages((prev) => {
-          const id =
-            streamingMessageId.current ??
-            [...prev].reverse().find((m) => m.role === "assistant" && m.status === "streaming")?.id;
-          if (!id) return prev;
-          return prev.map((m) =>
-            m.id === id ? { ...m, reasoning: m.reasoning?.includes(snippet) ? m.reasoning : `${m.reasoning ?? ""}${snippet}` } : m,
+          const { messages: withBubble, id } = appendStreamingAssistantBubble(prev);
+          streamingMessageId.current = id;
+          return withBubble.map((message) =>
+            message.id === id
+              ? {
+                  ...message,
+                  reasoning: message.reasoning?.includes(snippet)
+                    ? message.reasoning
+                    : `${message.reasoning ?? ""}${snippet}`,
+                }
+              : message,
           );
         });
         break;
@@ -628,8 +660,8 @@ export function useHermesRpc(options: UseHermesRpcOptions = {}) {
         setBusy(false);
         setTools((prev) => prev.map((t) => ({ ...t, status: "complete" })));
         if (id) {
-          setMessages((prev) =>
-            prev.map((m) =>
+          setMessages((prev) => {
+            const next = prev.map((m) =>
               m.id === id
                 ? {
                     ...m,
@@ -638,8 +670,12 @@ export function useHermesRpc(options: UseHermesRpcOptions = {}) {
                     status: data.status ?? "complete",
                   }
                 : m,
-            ),
-          );
+            );
+            const gatewayId = sessionIdRef.current;
+            const dbKey = gatewayId ? sessionKeyByGatewayIdRef.current[gatewayId] : undefined;
+            persistSessionTranscript(gatewayId, dbKey, next);
+            return next;
+          });
         }
         streamingMessageId.current = null;
         void refreshSessionsRef.current();
@@ -647,6 +683,11 @@ export function useHermesRpc(options: UseHermesRpcOptions = {}) {
       }
       case "tool.start":
         setBusy(true);
+        setMessages((prev) => {
+          const { messages, id } = appendStreamingAssistantBubble(prev);
+          streamingMessageId.current = id;
+          return messages;
+        });
         setTools((prev) => [
           {
             id: data.tool_id ?? `${Date.now()}`,
@@ -855,7 +896,7 @@ export function useHermesRpc(options: UseHermesRpcOptions = {}) {
   const applySessionSnapshot = useCallback((
     gatewayId: string,
     snapshot: SessionSnapshot,
-    options: { updateTranscript?: boolean } = {},
+    options: { updateTranscript?: boolean; transcript?: ChatMessage[] } = {},
   ) => {
     const updateTranscript = options.updateTranscript !== false;
     const dbKey = snapshot.session_key || sessionKeyByGatewayIdRef.current[gatewayId] || "";
@@ -888,22 +929,13 @@ export function useHermesRpc(options: UseHermesRpcOptions = {}) {
     }
     rememberGatewaySession(gatewayId);
 
-    let nextMessages: ChatMessage[] | null = null;
     if (updateTranscript && appliesToActiveSession) {
-      const serverMessages = mapHistoryMessages(snapshot.messages);
-      const cachedMessages = snapshot.running
-        ? [
-            ...loadCachedTranscript(gatewayId),
-            ...(dbKey ? loadCachedTranscript(dbKey) : []),
-          ]
-        : [];
-      const merged = snapshot.running
-        ? mergeTranscriptMessages(serverMessages, cachedMessages)
-        : serverMessages;
-      nextMessages = snapshot.running ? appendInProgressBubble(merged) : merged;
+      const nextMessages = options.transcript
+        ?? (snapshot.running ? appendInProgressBubble(mapHistoryMessages(snapshot.messages)) : mapHistoryMessages(snapshot.messages));
       const streaming = nextMessages.find((message) => message.status === "streaming");
       streamingMessageId.current = streaming?.id ?? null;
       setMessages(nextMessages);
+      persistSessionTranscript(gatewayId, dbKey || undefined, nextMessages);
     }
 
     if (snapshot.running) {
@@ -922,20 +954,58 @@ export function useHermesRpc(options: UseHermesRpcOptions = {}) {
       }
     }
 
-    // Do not write loaded transcripts back to the cache here. The cache is only
-    // for the local user prompt of an in-flight turn, written in sendPrompt().
+    // Loaded transcripts are persisted locally so reconnects can recover history.
   }, [linkSessionIds, markSessionIdle, markSessionRunning, rememberGatewaySession]);
+
+  const loadSessionTranscript = useCallback(async (
+    gatewayId: string,
+    snapshot: SessionSnapshot,
+  ): Promise<ChatMessage[]> => {
+    const dbKey = snapshot.session_key || sessionKeyByGatewayIdRef.current[gatewayId] || "";
+    const memoryMessages = mapHistoryMessages(snapshot.messages ?? []);
+    let dbMessages: ChatMessage[] = [];
+
+    try {
+      const historyResult: any = await rpc("session.history", { session_id: gatewayId });
+      dbMessages = mapHistoryMessages(
+        Array.isArray(historyResult?.messages) ? historyResult.messages : [],
+      );
+    } catch {
+      dbMessages = memoryMessages;
+    }
+
+    const cachedMessages = pickRicherTranscript(
+      loadCachedTranscript(gatewayId),
+      dbKey ? loadCachedTranscript(dbKey) : [],
+    );
+    let merged = pickRicherTranscript(dbMessages, memoryMessages);
+    merged = pickRicherTranscript(merged, cachedMessages);
+    if (snapshot.running) merged = appendInProgressBubble(merged);
+    return merged;
+  }, [rpc]);
 
   const syncSessionView = useCallback(async (
     gatewayId: string,
-    options: { updateTranscript?: boolean } = {},
+    options: { updateTranscript?: boolean; mergeWithCurrent?: boolean } = {},
   ) => {
     if (!gatewayId) return null;
     const snapshot = await fetchSessionSnapshot(url, gatewayId);
     if (!snapshot) return null;
-    applySessionSnapshot(gatewayId, snapshot, options);
+
+    let transcript: ChatMessage[] | undefined;
+    if (options.updateTranscript !== false) {
+      transcript = await loadSessionTranscript(gatewayId, snapshot);
+      if (options.mergeWithCurrent) {
+        transcript = pickRicherTranscript(transcript, messagesRef.current);
+      }
+    }
+
+    applySessionSnapshot(gatewayId, snapshot, {
+      updateTranscript: options.updateTranscript,
+      transcript,
+    });
     return snapshot;
-  }, [applySessionSnapshot, url]);
+  }, [applySessionSnapshot, loadSessionTranscript, url]);
 
   const findLiveGatewayForTarget = useCallback(
     (target: string, live: Awaited<ReturnType<typeof fetchLiveGatewaySessions>>): string | null => {
@@ -1034,28 +1104,16 @@ export function useHermesRpc(options: UseHermesRpcOptions = {}) {
           : gatewayIdBySessionKeyRef.current,
       );
       if (!stillActive) return;
-      const restored = Array.isArray(historyResult?.messages) ? historyResult.messages : [];
-      const serverMessages = mapHistoryMessages(restored);
-      const cachedMessages = parsed.running
-        ? [
-            ...loadCachedTranscript(gatewayId),
-            ...(parsed.sessionKey ? loadCachedTranscript(parsed.sessionKey) : []),
-          ]
-        : [];
-      const merged = parsed.running
-        ? mergeTranscriptMessages(serverMessages, cachedMessages)
-        : serverMessages;
-      const withProgress = parsed.running ? appendInProgressBubble(merged) : merged;
-      const streaming = withProgress.find((message) => message.status === "streaming");
-      streamingMessageId.current = streaming?.id ?? null;
-      setMessages(withProgress);
-      if (parsed.running) {
-        setBusy(true);
-        markSessionRunning(gatewayId, "Working…");
-      } else {
-        setBusy(false);
-        markSessionIdle(gatewayId, "Ready");
-      }
+      const fallbackSnapshot: SessionSnapshot = {
+        gateway_id: gatewayId,
+        session_key: parsed.sessionKey || sessionKeyByGatewayIdRef.current[gatewayId] || "",
+        running: parsed.running,
+        activity: parsed.running ? "Working…" : "",
+        messages: Array.isArray(historyResult?.messages) ? historyResult.messages : [],
+        active_tools: [],
+      };
+      const transcript = await loadSessionTranscript(gatewayId, fallbackSnapshot);
+      applySessionSnapshot(gatewayId, fallbackSnapshot, { transcript });
       setStatus(`Opened live session ${parsed.sessionKey || gatewayId}`);
       rememberActiveSession(gatewayId, parsed.sessionKey || null);
       return;
@@ -1080,7 +1138,9 @@ export function useHermesRpc(options: UseHermesRpcOptions = {}) {
     );
     rememberActiveSession(gatewayId, snapshot.session_key || null);
   }, [
+    applySessionSnapshot,
     linkSessionIds,
+    loadSessionTranscript,
     markSessionIdle,
     markSessionRunning,
     rememberActiveSession,
@@ -1113,7 +1173,9 @@ export function useHermesRpc(options: UseHermesRpcOptions = {}) {
     setBusy(false);
     streamingMessageId.current = null;
     const restored = Array.isArray(result?.messages) ? result.messages : [];
-    setMessages(mapHistoryMessages(restored));
+    const resumedMessages = mapHistoryMessages(restored);
+    setMessages(resumedMessages);
+    persistSessionTranscript(sid, resumedKey, resumedMessages);
     void syncGatewaySessionStatus(sid);
     setStatus(`Resumed ${resumedKey}`);
     rememberActiveSession(sid, resumedKey);
@@ -1375,6 +1437,7 @@ export function useHermesRpc(options: UseHermesRpcOptions = {}) {
       if (!runtime?.running && !busy) return;
       void syncSessionViewRef.current(gatewayId, {
         updateTranscript: !streamingMessageId.current,
+        mergeWithCurrent: true,
       });
     }, 2000);
     return () => clearInterval(timer);

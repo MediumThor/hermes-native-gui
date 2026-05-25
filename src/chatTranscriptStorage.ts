@@ -83,3 +83,17 @@ export function mergeTranscriptMessages(
 
   return serverMessages.length >= cachedMessages.length ? serverMessages : cachedMessages;
 }
+
+/** Merge two transcript views without dropping the richer history. */
+export function pickRicherTranscript(
+  primary: ChatMessage[],
+  secondary: ChatMessage[],
+): ChatMessage[] {
+  if (primary.length === 0) return secondary;
+  if (secondary.length === 0) return primary;
+  const mergedPrimary = mergeTranscriptMessages(primary, secondary);
+  const mergedSecondary = mergeTranscriptMessages(secondary, primary);
+  if (mergedPrimary.length > mergedSecondary.length) return mergedPrimary;
+  if (mergedSecondary.length > mergedPrimary.length) return mergedSecondary;
+  return mergedPrimary.length >= primary.length ? mergedPrimary : mergedSecondary;
+}

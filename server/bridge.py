@@ -311,6 +311,16 @@ def _session_snapshot_payload(gateway_id: str, session: dict) -> dict[str, objec
     from tui_gateway import server as tui_server
 
     history = list(session.get("history") or [])
+    db = tui_server._get_db()
+    if db is not None and session.get("session_key"):
+        try:
+            history = db.get_messages_as_conversation(
+                session["session_key"],
+                include_ancestors=True,
+            )
+        except Exception:
+            pass
+
     messages = tui_server._history_to_messages(history)
     tool_started_at = session.get("tool_started_at") or {}
     tool_names: dict[str, str] = {}
